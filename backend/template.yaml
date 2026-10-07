@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Real-time auction backend - API Gateway WebSocket + Lambda (Python) + DynamoDB
+
+Parameters:
+  StageName:
+    Type: String
+    Default: dev
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS origin for the HTTP API and image uploads (set to your Amplify URL in production)
+  AuthMode:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, cognito, supabase]
+    Description: >-
+      Identity source. 'dev' = passwordless test logins (anyone can be anyone; demos only).
+      'cognito' / 'supabase' are not implemented yet (see src/auction/auth.py).
+  DevAuthSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: HMAC secret for AUTH_MODE=dev tokens (at least 16 characters)
+  AdminEmails:
+    Type: String
+    Default: ""
+    Description: Comma-separated emails that are admins (approve buyers/sellers)
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    CodeUri: src/
+    Timeout: 15
+    MemorySize: 256
+    Environment:
+      Variables:
+        AUCTIONS_TABLE: !Ref AuctionsTable
+        BIDS_TABLE: !Ref BidsTable
+        CONNECTIONS_TABLE: !Ref ConnectionsTable
+        USERS_TABLE: !Ref UsersTable
+        AUTH_MODE: !Ref AuthMode
+        DEV_AUTH_SECRET: !Ref DevAuthSecret
+        ADMIN_EMAILS: !Ref AdminEmails
+
+Resources:
+  # ------------------------------------------------------------------ DynamoDB
+  AuctionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: auctionId, AttributeType: S }
+        - { AttributeName: listing, AttributeType: S }
+        - { AttributeName: category, AttributeType: S }
+        - { AttributeName: sellerId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: N }
+      KeySchema:
+        - { AttributeName: auctionId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byListing
+          KeySchema:
+            - { AttributeName: listing, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: byCategory
+          KeySchema:
+            - { AttributeName: category, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: bySeller
+          KeySchema:
+            - { AttributeName: sellerId, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  BidsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: auctionId, AttributeType: S }
+        - { AttributeName: bidId, AttributeType: S }
+        - { AttributeName: amount, AttributeType: N }
+        - { AttributeName: bidderId, AttributeType: S }
+        - { AttributeName: placedAt, AttributeType: N }
+      KeySchema:
+        - { AttributeName: auctionId, KeyType: HASH }
+        - { AttributeName: bidId, KeyType: RANGE }
+      LocalSecondaryIndexes:
+        - IndexName: byAmount
+          KeySchema:
+            - { AttributeName: auctionId, KeyType: HASH }
+            - { AttributeName: amount, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      GlobalSecondaryIndexes:
+        - IndexName: byBidder
+          KeySchema:
+            - { AttributeName: bidderId, KeyType: HASH }
+            - { AttributeName: placedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: connectionId, AttributeType: S }
+        - { AttributeName: sk, AttributeType: S }
+        - { AttributeName: auctionId, AttributeType: S }
+      KeySchema:
+        # sk = META (who is connected) or SUB#<auctionId> (one row per followed auction)
+        - { AttributeName: connectionId, KeyType: HASH }
+        - { AttributeName: sk, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byAuction
+          KeySchema:
+            - { AttributeName: auctionId, KeyType: HASH }
+          Projection: { ProjectionType: KEYS_ONLY }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ------------------------------------------------------------------ Images (private; served via signed URLs)
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedMethods: [POST]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  # ------------------------------------------------------------------ WebSocket API
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-ws"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketFunction.Arn}/invocations"
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  SubscribeRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: subscribe
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  PlaceBidRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: placeBid
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  PingRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: ping
+      Target: !Sub "integrations/${WebSocketIntegration}"
+  WatchRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: watch
+      Target: !Sub "integrations/${WebSocketIntegration}"
+
+  # Renamed whenever routes change, so CloudFormation creates a fresh deployment.
+  WebSocketDeploymentV2:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn: [ConnectRoute, DisconnectRoute, DefaultRoute, SubscribeRoute, PlaceBidRoute, PingRoute, WatchRoute]
+    Properties:
+      ApiId: !Ref WebSocketApi
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: !Ref StageName
+      DeploymentId: !Ref WebSocketDeploymentV2
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 500
+        ThrottlingRateLimit: 1000
+
+  WebSocketInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+
+  # ------------------------------------------------------------------ Functions
+  WebSocketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.ws.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AuctionsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref BidsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ConnectionsTable }
+        - Statement:
+            # Bids read the bidder's account and ConditionCheck its approval in the transaction.
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:ConditionCheckItem]
+              Resource: !GetAtt UsersTable.Arn
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+
+  BroadcastFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.stream.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          WS_ENDPOINT: !Sub "https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ConnectionsTable }
+        - Statement:
+            - Effect: Allow
+              Action: execute-api:ManageConnections
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*"
+      Events:
+        AuctionChanges:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AuctionsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 0
+            MaximumRetryAttempts: 3
+            BisectBatchOnFunctionError: true
+
+  HttpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.http.handler
+      Environment:
+        Variables:
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
+          CLOSE_FUNCTION_ARN: !GetAtt CloseAuctionFunction.Arn
+          IMAGES_BUCKET: !Ref ImagesBucket
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AuctionsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref BidsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - S3CrudPolicy: { BucketName: !Ref ImagesBucket }
+        - Statement:
+            - Effect: Allow
+              Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule, scheduler:DeleteSchedule]
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/close-*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerInvokeRole.Arn
+      Events:
+        # Routing happens in handlers/http.py, so new endpoints don't need template changes.
+        Api:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: "/{proxy+}", Method: ANY }
+
+  CloseAuctionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.scheduler.handler
+      Timeout: 90
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref AuctionsTable }
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
+      Policies:
+        - PolicyName: invoke-close-function
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CloseAuctionFunction.Arn
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
+        AllowHeaders: [content-type, authorization]
+
+Outputs:
+  WebSocketUrl:
+    Description: Set as NEXT_PUBLIC_WS_URL in the frontend
+    Value: !Sub "wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+  HttpApiUrl:
+    Description: Set as NEXT_PUBLIC_API_URL in the frontend
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"

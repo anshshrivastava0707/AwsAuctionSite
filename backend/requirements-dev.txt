@@ -1,0 +1,6 @@
+# Lambda code itself has no third-party deps (boto3 ships with the runtime).
+boto3
+moto[dynamodb]
+pytest
+cfn-lint
+websockets

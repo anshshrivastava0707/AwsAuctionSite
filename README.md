@@ -1,0 +1,141 @@
+# Real-time auction — AWS serverless backend + Next.js frontend
+
+```
+awsproject/
+├── backend/    Python 3.12 Lambdas, SAM template, tests, local server, load-test script
+└── frontend/   Next.js 15 (App Router, TypeScript)
+```
+
+Features: accounts with admin-approved buyer and seller roles, profiles with pictures, auction
+listings with photos, category, condition, quantity (sold as one lot to a single winner) and
+start/end times, edit or cancel before the first bid, live bidding, bidding history, and
+"items I'm selling". Logged-out visitors can browse and watch auctions live, but can't bid.
+
+## Architecture
+
+```
+Browser ──wss──► API Gateway WebSocket API ──► WebSocketFunction ($connect/$disconnect/subscribe/placeBid/ping)
+   │                                                 │
+   └──https──► API Gateway HTTP API ──► HttpFunction  │  (ANY /{proxy+}: routing in handlers/http.py)
+                                          │  │        ▼
+                                          │  │   DynamoDB: Auctions (stream) · Bids · Connections · Users
+                                          │  └─► S3 (images, private; signed upload/download URLs)
+                                          │           │
+                         EventBridge Scheduler        └─ Stream ─► BroadcastFunction ─► postToConnection (all subscribers)
+                         (one-shot at endsAt) ─► CloseAuctionFunction
+```
+
+## How each requirement is met
+
+| Requirement | Mechanism | Code |
+|---|---|---|
+| **Live push** | API Gateway WebSocket. Every committed change to an auction flows through the DynamoDB Stream to `BroadcastFunction`, which pushes it to all subscribers. Clients are only told about **committed** state. | `handlers/stream.py`, `auction/connections.py` |
+| **Race-safe bids** | Each bid is one `TransactWriteItems`: a conditional update of the auction (`status = OPEN AND endsAt > now AND minNextBid <= amount`) plus a conditional insert of the bid (`attribute_not_exists(bidId)`). The check and the write are a single atomic compare-and-set inside DynamoDB. A stale or lower bid fails its condition and is rejected with the current state. Simultaneous transactions that DynamoDB cancels with `TransactionConflict` are retried, and each retry is re-checked against the newly committed state. Ties: the first to commit wins, because the next bid must be ≥ high + increment. | `auction/repository.py::place_bid` |
+| **Persisted state** | DynamoDB is the only source of truth; Lambdas are stateless. A fresh page load (Next.js server render → `GET /auctions/{id}`) and a WebSocket `subscribe` both do a **strongly consistent** read. | `repository.snapshot` |
+| **Identity & approval** | The backend never trusts a user id sent by the client. HTTP calls carry `Authorization: Bearer <token>`, and the WebSocket gets the token as `?token=` at `$connect`, which binds the identity to the connection. Bids use that identity. Buyer approval is a `ConditionCheck` **inside** the bid transaction, so revoking it takes effect atomically. The token source is pluggable (`auction/auth.py`). | `auction/auth.py`, `auction/users.py` |
+| **Seller rules** | Sellers can't bid on their own auctions (`sellerId <> bidder` in the bid condition). Edit and cancel are conditional on `bidCount = 0`, so an edit and a first bid can never both succeed. Each bid also carries the `termsVersion` it was placed against, and an edit in between rejects it with `TERMS_CHANGED`. | `repository.update_auction`, `cancel_auction` |
+| **Disconnect / reconnect safety** | `$disconnect` deletes only a routing row and never touches auction data. Dead connections are pruned on 410 Gone and by TTL. Bids are idempotent by client-generated `bidId`: a client that drops mid-bid reconnects and re-sends the same bid, and is told "already accepted" instead of bidding twice. Subscribe registers **before** reading the snapshot, so no update falls in between. Every message carries a monotonically increasing `version`: clients drop old or duplicate updates and re-sync on a gap. A heartbeat `ping` returns the current version as a backstop check. | `handlers/ws.py`, `frontend/lib/useAuctionSocket.ts` |
+
+## WebSocket protocol
+
+Connect to `<WebSocketUrl>?token=<login token>` to bid. Without a token, the connection can only watch.
+The bidder is always the connection's user; any `bidderId` in a message is ignored.
+
+Client → server (`action` selects the API Gateway route):
+
+```json
+{"action":"subscribe","auctionId":"…"}
+{"action":"placeBid","auctionId":"…","bidId":"<uuid>","amount":1500,"termsVersion":1}
+{"action":"ping","auctionId":"…"}
+```
+
+Server → client:
+
+```json
+{"type":"snapshot","auction":{…},"bids":[…]}
+{"type":"auctionUpdate","auction":{…},"bid":{…}?}
+{"type":"bidResult","bidId":"…","status":"ACCEPTED|REJECTED","reason":"BID_TOO_LOW|AUCTION_CLOSED|NOT_STARTED|OWN_AUCTION|TERMS_CHANGED|NOT_APPROVED|NOT_AUTHENTICATED|NOT_FOUND|DUPLICATE_ID|BUSY|STALE|null","message":"…","duplicate":false,"auction":{…}}
+{"type":"pong","auctionId":"…","version":7}
+{"type":"error","message":"…"}
+```
+
+All money values are **integer cents**; all times are epoch milliseconds.
+
+## Accounts and login
+
+`AUTH_MODE` (a template parameter) selects where identities come from:
+
+- **`dev`** (implemented): `POST /auth/dev-login {email}` returns an HMAC-signed token. There are no
+  passwords, so anyone can sign in as any email. Use it only for local work and demos.
+- **`cognito` / `supabase`** (not implemented yet): these provide sign-up, login, password reset and email
+  verification. To add one, implement `_provider_identity` in `backend/src/auction/auth.py` (verify the
+  provider's JWT and return its `sub` and `email`), and `login`/`logout` in `frontend/lib/auth.tsx`. Nothing
+  else changes.
+
+Approval is separate from login. After first login a user creates an account (`POST /me`), and an admin
+(an email in `AdminEmails`) approves each role at `/admin`. Buyer status `APPROVED` is needed to bid; seller
+status `APPROVED` is needed to list. Admins are approved for both roles automatically.
+
+## HTTP API
+
+Public: `GET /auctions?category=`, `GET /auctions/{id}`, `GET /users/{id}`, `GET /users/{id}/auctions`,
+`GET /images/{key}`. Logged in: `GET|POST|PUT /me`, `POST /me/seller-request`, `GET /me/bids`,
+`GET /me/auctions`, `POST /uploads`, `POST /auctions`, `PATCH /auctions/{id}`, `POST /auctions/{id}/cancel`.
+Admin: `GET /admin/users?filter=pending|all`, `POST /admin/users/{id}`. See `backend/src/handlers/http.py`.
+
+## Backend
+
+Prerequisites: an AWS account with credentials configured (`aws configure` or SSO), the
+[AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), and the
+[SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html).
+
+```bash
+cd backend
+source .venv/bin/activate          # already created; deps from requirements-dev.txt
+pytest                             # unit + handler tests (moto, offline), incl. a 40-thread bid race x5
+cfn-lint template.yaml             # template lint
+
+sam build
+sam deploy --guided                # first time; set DevAuthSecret (16+ chars) and AdminEmails; prints the URLs
+sam sync --watch                   # fast iteration on Lambda code against the dev stack
+```
+
+Prove concurrency against the real deployment:
+
+```bash
+python scripts/concurrency_test.py --api <HttpApiUrl> --ws <WebSocketUrl> --admin-email <an AdminEmails entry> --bidders 40 --watchers 5
+```
+
+Tear down: `sam delete`.
+
+## Frontend
+
+Node is installed user-locally at `~/.local/node` (add `export PATH=$HOME/.local/node/bin:$PATH` to your shell).
+
+```bash
+cd frontend
+cp .env.example .env.local         # fill in the two URLs from `sam deploy` outputs
+npm run dev                        # http://localhost:3000
+```
+
+Against the local backend (`python scripts/local_server.py`, admin login `admin@local.test`), use same-origin paths so the
+whole app is served from port 3000. Next.js proxies `/api` and `/ws` to the backend
+(`next.config.ts`), so one tunnel (e.g. `ngrok http 3000`) is enough to share it:
+
+```bash
+NEXT_PUBLIC_API_URL=/api NEXT_PUBLIC_WS_URL=/ws npm run dev
+```
+
+Deploy: connect the repo to **AWS Amplify Hosting** (app root `frontend`, same two env vars). Then
+redeploy the backend with `--parameter-overrides AllowedOrigin=https://<your-amplify-domain>`.
+
+## Known limits / next steps
+- The offline concurrency test runs on moto. moto's in-process DynamoDB is **not** atomic across threads (without help it lost an update in testing), so the test serialises moto's backend operations to emulate DynamoDB's per-request atomicity. The authoritative concurrency proof is `scripts/concurrency_test.py` against the real stack.
+- **The real auth provider is not implemented yet.** In `dev` mode anyone can log in as any email, so approval is only as strong as the login. See "Accounts and login".
+- A login token is checked when the WebSocket connects; a connection opened before approval was revoked still bids as that user, but the bid's `ConditionCheck` rejects it.
+- `GET /me/bids` reads a global secondary index, which is eventually consistent: a bid placed a moment ago can take about a second to appear.
+- A listing stores the seller's display name at creation; renaming later doesn't update old listings.
+- `GET /auctions` reads one index partition (`listing = "ALL"`), which is fine at demo scale; shard it for heavy traffic. Auctions created before this version have no `listing` or `sellerId` and don't appear in lists.
+- Admin user lists use a filtered Scan of the Users table (admin-only and small).
+- Under extreme contention on one auction, a bid can come back `BUSY` after 8 conflict retries. It is rejected cleanly, never applied incorrectly.
+- The WebSocket `Deployment` resource is static. If you add or change routes, rename its logical ID so CloudFormation creates a new deployment.

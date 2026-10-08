@@ -62,7 +62,24 @@ def _recipient(user_id: str | None) -> dict | None:
     return user if user and user.get("emailNotifications") is not False else None
 
 
+# Demo and placeholder accounts have addresses nobody can receive mail at; sending to
+# them would only bounce (and bounces hurt the sender's reputation with SES).
+UNDELIVERABLE_DOMAINS = {"bidbloom.demo", "example.com", "example.org", "example.net"}
+
+
+def _deliverable(address: str) -> bool:
+    return address.rsplit("@", 1)[-1].lower() not in UNDELIVERABLE_DOMAINS
+
+
 def _deliver(to: list[str], subject: str, text: str, body_html: str, cc: list[str] | None = None) -> None:
+    skipped = [a for a in to + (cc or []) if not _deliverable(a)]
+    to, cc = [a for a in to if _deliverable(a)], [a for a in (cc or []) if _deliverable(a)]
+    if skipped:
+        log.info("email not sent to demo address(es) %s: %s", ", ".join(skipped), subject)
+    if not to and cc:
+        to, cc = cc, []
+    if not to:
+        return
     sender = os.environ.get("NOTIFY_FROM", "")
     if not sender:
         log.info("email (not sent, NOTIFY_FROM unset) to %s%s: %s", ", ".join(to),

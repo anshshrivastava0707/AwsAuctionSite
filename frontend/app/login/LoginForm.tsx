@@ -7,6 +7,19 @@ import { cognitoEnabled, confirmForgotPassword, confirmSignUp, CognitoError, for
 
 type Step = "signin" | "signup" | "confirm" | "forgot" | "reset";
 
+interface DemoAccount { label: string; email: string; password: string; note?: string }
+
+/** Ready-made accounts for judges/reviewers (backend/scripts/create_demo_accounts.py).
+ *  Only shown where NEXT_PUBLIC_DEMO_ACCOUNTS is set, i.e. on demo deployments. */
+const DEMO_ACCOUNTS: DemoAccount[] = (() => {
+  try {
+    const list = JSON.parse(process.env.NEXT_PUBLIC_DEMO_ACCOUNTS ?? "[]");
+    return Array.isArray(list) ? list.filter((a) => a && a.email && a.password) : [];
+  } catch {
+    return [];
+  }
+})();
+
 const TITLES: Record<Step, string> = {
   signin: "Log in",
   signup: "Create your account",
@@ -108,6 +121,12 @@ export default function LoginForm({ next, signup }: { next: string; signup: bool
 
   const needsPassword = step === "signin" || step === "signup" || step === "reset";
   const needsCode = step === "confirm" || step === "reset";
+  function logInAsDemo(a: DemoAccount) {
+    setEmail(a.email);
+    setPassword(a.password);
+    void run(() => login(a.email, a.password));
+  }
+
   const submitLabel = {
     signin: "Log in", signup: "Create account", confirm: "Confirm email", forgot: "Send reset code", reset: "Set password",
   }[step];
@@ -159,6 +178,27 @@ export default function LoginForm({ next, signup }: { next: string; signup: bool
         {error && <p className="notice bad">{error}</p>}
         <button type="submit" disabled={busy}>{busy ? "Please wait…" : submitLabel}</button>
       </form>
+
+      {step === "signin" && DEMO_ACCOUNTS.length > 0 && (
+        <div className="demo-accounts">
+          <div className="demo-head">
+            <strong>Judging or just looking?</strong>
+            <span className="hint">Log in with a ready-made account. Use two browsers to bid against each other.</span>
+          </div>
+          {DEMO_ACCOUNTS.map((a) => (
+            <div key={a.email} className="demo-row">
+              <div>
+                <div className="demo-label">{a.label}</div>
+                {a.note && <div className="hint">{a.note}</div>}
+                <div className="demo-cred"><code>{a.email}</code> · <code>{a.password}</code></div>
+              </div>
+              <button type="button" className="secondary small" disabled={busy} onClick={() => logInAsDemo(a)}>
+                Log in
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="auth-links small">
         {step === "signin" && (

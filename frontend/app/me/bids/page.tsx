@@ -10,7 +10,7 @@ import type { Auction, BidHistoryEntry, PrivateUser } from "@/lib/types";
 import { useNow } from "@/lib/useNow";
 import { type AlertKind, useWatchAuctions } from "@/lib/useWatchAuctions";
 
-const CONN_LABEL = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting…", unconfigured: "Not configured" };
+const CONN_LABEL = { connecting: "Connecting…", live: "Connected", reconnecting: "Reconnecting…", unconfigured: "Not configured" };
 
 const ALERT_TEXT: Record<AlertKind, (title: string, amount: string) => string> = {
   OUTBID: (t, amt) => `You were outbid on "${t}" — the high bid is now ${amt}.`,

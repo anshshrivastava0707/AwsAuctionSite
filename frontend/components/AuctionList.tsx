@@ -35,7 +35,7 @@ export default function AuctionList({ initial, nextCursor, query }: {
 
   return (
     <>
-      <AuctionGrid auctions={extra.length ? [...initial, ...extra] : initial} />
+      <AuctionGrid browse auctions={extra.length ? [...initial, ...extra] : initial} />
       {(cursor || error) && (
         <div className="load-more">
           {error && <p className="notice bad">{error}</p>}

@@ -16,7 +16,7 @@ import Gallery from "./Gallery";
 
 const CONN_LABEL: Record<ConnStatus, string> = {
   connecting: "Connecting…",
-  live: "Live",
+  live: "Connected",
   reconnecting: "Reconnecting…",
   unconfigured: "Not configured",
 };
@@ -140,9 +140,12 @@ export default function LiveAuction({ initial }: { initial: Snapshot }) {
             <span className="actions">
               {!isSeller && <FavoriteButton auctionId={auction.auctionId} title={auction.title} />}
               <span className={`pill ${PHASE_PILL[phase]}`}>{PHASE_LABEL[phase]}</span>
-              <span className={`pill ${conn}`} title="Real-time connection">
-                <span className="dot" /> {CONN_LABEL[conn]}
-              </span>
+              {/* Connection status, not the auction's: only worth showing while bidding is possible. */}
+              {(phase === "LIVE" || phase === "SCHEDULED") && (
+                <span className={`pill ${conn}`} title="Real-time updates">
+                  <span className="dot" /> {CONN_LABEL[conn]}
+                </span>
+              )}
             </span>
           </div>
           <div className="meta">

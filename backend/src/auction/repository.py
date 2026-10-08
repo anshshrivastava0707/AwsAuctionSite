@@ -50,7 +50,8 @@ from botocore.exceptions import ClientError
 from . import config
 from .errors import Conflict, Forbidden, NotFound
 from .models import (
-    APPROVED, CANCELLED, CLOSED, EXTEND_WINDOW_MS, OPEN, OPEN_LISTING, now_ms, parse_auction_update, phase,
+    APPROVED, CANCELLED, CLOSED, EXTEND_WINDOW_MS, OPEN, OPEN_LISTING, RECENTLY_ENDED_MS, now_ms,
+    parse_auction_update, phase,
     public_auction, public_bid, search_text,
 )
 
@@ -167,19 +168,25 @@ def _price(a: dict) -> int:
 
 def list_auctions(category: str | None = None, limit: int = 50, *, sort: str = "newest",
                   query: str = "", cursor: str | None = None, at_ms: int | None = None) -> tuple[list[dict], str | None]:
-    """A page of auctions and the cursor for the next one (None at the end).
+    """A page of the browse listings and the cursor for the next one (None at the end).
 
-    newest   all non-cancelled listings, newest first (byListing / byCategory index)
-    ending   open listings by end time, soonest first (byEnding index)
-    price_*  open listings by current price (sorted here, up to MAX_SCAN_RESULTS)
+    Browse pages show live and upcoming auctions plus those that ended in the last
+    RECENTLY_ENDED_MS (15 minutes); after that an auction is only reachable from
+    its own page, the seller's profile and people's histories. Cancelled and
+    removed listings never show.
+
+    newest   newest first (byListing / byCategory index)
+    ending   soonest end first, then the recently ended (byEnding index)
+    price_*  by current price, recently ended last (sorted here, up to MAX_SCAN_RESULTS)
     query    words that must all appear in the listing; a filtered Scan, fine for
              thousands of listings. Past that, move search to OpenSearch.
     """
     at = at_ms if at_ms is not None else now_ms()
+    since = at - RECENTLY_ENDED_MS
     words = [w for w in query.lower().split() if w][:8]
     if sort not in SORTS:
         sort = "newest"
-    not_cancelled = Attr("status").ne(CANCELLED)
+    on_site = Attr("status").ne(CANCELLED) & Attr("endsAt").gt(since)
 
     if not words and sort == "newest":
         if category:
@@ -187,37 +194,49 @@ def list_auctions(category: str | None = None, limit: int = 50, *, sort: str = "
         else:
             index, key, attrs = "byListing", Key("listing").eq("ALL"), ("auctionId", "listing", "createdAt")
         return _keyed_page(index, key, limit=limit, cursor=_decode_cursor(cursor), key_attrs=attrs,
-                           forward=False, filter_expr=not_cancelled)
+                           forward=False, filter_expr=on_site)
 
     # endsAt is the byEnding sort key, and DynamoDB doesn't allow filters on key
-    # attributes, so "not ended yet" goes in the key condition.
-    still_open = Key("openListing").eq(OPEN_LISTING) & Key("endsAt").gt(at)
+    # attributes, so the time window goes in the key condition.
+    by_category = Attr("category").eq(category) if category else None
     if not words and sort == "ending":
-        f = Attr("category").eq(category) if category else None
-        return _keyed_page("byEnding", still_open, limit=limit,
-                           cursor=_decode_cursor(cursor), key_attrs=("auctionId", "openListing", "endsAt"),
-                           forward=True, filter_expr=f)
+        page, next_cursor = _keyed_page(
+            "byEnding", Key("openListing").eq(OPEN_LISTING) & Key("endsAt").gt(at), limit=limit,
+            cursor=_decode_cursor(cursor), key_attrs=("auctionId", "openListing", "endsAt"), forward=True,
+            filter_expr=by_category)
+        if next_cursor is None:
+            # After the last live one: what ended in the last 15 minutes, most recent first.
+            kwargs = {"FilterExpression": by_category} if by_category is not None else {}
+            page += _query(_auctions(), MAX_SCAN_RESULTS, max_pages=10, IndexName="byEnding",
+                           KeyConditionExpression=Key("openListing").eq(OPEN_LISTING)
+                           & Key("endsAt").between(since + 1, at),
+                           ScanIndexForward=False, **kwargs)
+        return page, next_cursor
 
-    # Sorted in memory: price sorts over open listings, or any sort over search matches.
+    # Sorted in memory: price sorts, or any sort over search matches.
     if words:
-        f = not_cancelled
+        f = on_site
         for w in words:
             f = f & Attr("searchText").contains(w)
-        if category:
-            f = f & Attr("category").eq(category)
-        if sort != "newest":
-            f = f & Attr("openListing").exists()
+        if by_category is not None:
+            f = f & by_category
         items = _scan(f)
     else:
-        kwargs = {"FilterExpression": Attr("category").eq(category)} if category else {}
+        kwargs = {"FilterExpression": by_category} if by_category is not None else {}
         items = _query(_auctions(), MAX_SCAN_RESULTS, max_pages=50, IndexName="byEnding",
-                       KeyConditionExpression=still_open, **kwargs)
+                       KeyConditionExpression=Key("openListing").eq(OPEN_LISTING) & Key("endsAt").gt(since),
+                       **kwargs)
+
+    def ended(a: dict) -> bool:
+        return a.get("status") == CLOSED or int(a["endsAt"]) <= at
+
     if sort == "newest":
         items.sort(key=lambda a: -int(a["createdAt"]))
     elif sort == "ending":
-        items.sort(key=lambda a: int(a["endsAt"]))
+        items.sort(key=lambda a: (ended(a), int(a["endsAt"]) * (-1 if ended(a) else 1)))
     else:
-        items.sort(key=_price, reverse=sort == "price_high")
+        sign = -1 if sort == "price_high" else 1
+        items.sort(key=lambda a: (ended(a), sign * _price(a)))
     offset = int((_decode_cursor(cursor) or {}).get("offset", 0))
     page = items[offset:offset + limit]
     more = offset + limit < len(items)
@@ -282,7 +301,9 @@ def close_auction(auction_id: str, at_ms: int | None = None) -> bool:
     try:
         _auctions().update_item(
             Key={"auctionId": auction_id},
-            UpdateExpression="SET #status = :closed, #version = #version + :one, updatedAt = :now REMOVE openListing",
+            # openListing stays: a closed auction remains on the browse pages for
+            # RECENTLY_ENDED_MS, selected by its endsAt (see list_auctions).
+            UpdateExpression="SET #status = :closed, #version = #version + :one, updatedAt = :now",
             ConditionExpression="attribute_exists(auctionId) AND #status = :open AND endsAt <= :now",
             ExpressionAttributeNames={"#status": "status", "#version": "version"},
             ExpressionAttributeValues={":closed": "CLOSED", ":open": OPEN, ":one": 1, ":now": at},
@@ -553,7 +574,7 @@ def plan_bid(state: dict, bid: dict, at: int) -> BidPlan:
         return BidPlan(
             sets=leader_sets(price, highBidderId=me, highBidderName=my_name, proxyMax=price,
                              status=CLOSED, endsAt=at, soldVia="BUY_NOW"),
-            removes=["openListing"], records=[mine(price, 0) | {"buyNow": True}], leading=True,
+            removes=[], records=[mine(price, 0) | {"buyNow": True}], leading=True,
             message=f"You bought it for {_dollars(price)}!",
         )
 

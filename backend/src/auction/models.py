@@ -25,8 +25,12 @@ MAX_IMAGES = 8
 MAX_QUANTITY = 1000
 # Soft close: a bid this close to the end pushes the end out to now + this.
 EXTEND_WINDOW_MS = 2 * 60 * 1000
-# Constant partition key of the byEnding index; present only while an auction is OPEN.
+# Constant partition key of the byEnding index. Present on every listing that is
+# still on the site (removed only by a cancellation or an admin takedown); closed
+# auctions keep it, and queries pick live / recently ended ones by endsAt range.
 OPEN_LISTING = "OPEN"
+# How long an ended auction stays on the browse pages before it drops off.
+RECENTLY_ENDED_MS = 15 * 60 * 1000
 
 # Keep in sync with frontend/lib/types.ts.
 CATEGORIES = (
@@ -287,7 +291,7 @@ def new_auction_item(data: dict, seller: dict, created_at_ms: int | None = None)
         "termsVersion": 1,
         # Constant partition key for the byListing index ("all auctions, newest first").
         "listing": "ALL",
-        # Partition key of the byEnding index; removed when the auction closes or is cancelled.
+        # Partition key of the byEnding index; removed only by cancellation or takedown.
         "openListing": OPEN_LISTING,
         "price": data["startingPrice"],
         "searchText": search_text(data, seller["displayName"]),

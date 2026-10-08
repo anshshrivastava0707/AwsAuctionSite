@@ -91,6 +91,14 @@ Approval is separate from login. After first login a user creates an account (`P
 (an email in `AdminEmails`) approves each role at `/admin`. Buyer status `APPROVED` is needed to bid; seller
 status `APPROVED` is needed to list. Admins are approved for both roles automatically.
 
+### Demo accounts for judges
+
+`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) four approved accounts
+with known passwords — two buyers, a seller and an admin — on `bidbloom.demo` addresses, which can't
+receive mail and are never emailed. Add `judge.admin@bidbloom.demo` to the stack's `AdminEmails` for the
+admin one to have admin rights. The script prints a `NEXT_PUBLIC_DEMO_ACCOUNTS` value; set it on a
+frontend deployment to list the accounts, with one-click login, on its login page.
+
 ## HTTP API
 
 Public: `GET /auctions?category=&sort=newest|ending|price_low|price_high&q=&cursor=&limit=` (a page plus
@@ -152,6 +160,7 @@ redeploy the backend with `--parameter-overrides AllowedOrigin=https://<your-amp
 - In `dev` auth mode anyone can log in as any email, so approval is only as strong as the login. Use `cognito` for anything real.
 - Emails need an SES-verified sender in `NotifyFrom`; while the account is in the SES sandbox they only reach verified addresses. Without `NotifyFrom` they are logged, not sent. Outbid emails aren't throttled, so a long bidding war sends one per lead change.
 - Search is a filtered Scan over `searchText` (fine for thousands of listings; move to OpenSearch beyond that), and price sorts work over at most 1,000 open listings.
+- Browse pages (home, sorts, search) show live and upcoming auctions plus those that ended in the last 15 minutes; older ones stay reachable from their own page, the seller's profile, My bids and Selling.
 - Thumbnails are made by `ThumbnailFunction` a moment after upload; pages fall back to the original image until then (and for images uploaded before thumbnails existed).
 - A login token is checked when the WebSocket connects; a connection opened before approval was revoked still bids as that user, but the bid's `ConditionCheck` rejects it.
 - `GET /me/bids` reads a global secondary index, which is eventually consistent: a bid placed a moment ago can take about a second to appear.

@@ -107,8 +107,7 @@ export default async function Home({ searchParams }: { searchParams: Promise<Par
       {!error && auctions.length === 0 && (
         <div className="empty-state">
           {q ? <>No auctions match “{q}”. <Link href={href({ q: undefined })}>Clear search</Link></>
-            : sort === "newest" ? "No auctions here yet."
-            : <>Nothing live or upcoming here right now. <Link href={href({ sort: "newest" })}>See past auctions</Link></>}
+            : "Nothing live or upcoming here right now. Check back soon!"}
         </div>
       )}
       {/* key: a new search or filter starts a fresh list (and drops pages loaded for the old one) */}

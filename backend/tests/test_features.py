@@ -200,7 +200,7 @@ def test_buy_now_closes_the_auction(seller, people):
     r = repository.place_bid(bid(a, 9000, people("alice"), buyNow=True))
     assert r.accepted and r.auction["phase"] == "ENDED" and r.auction["soldVia"] == "BUY_NOW"
     s = state(a)
-    assert s["status"] == "CLOSED" and s["highBidderId"] == people("alice")["userId"] and "openListing" not in s
+    assert s["status"] == "CLOSED" and s["highBidderId"] == people("alice")["userId"]
     r = repository.place_bid(bid(a, 9100, people("bob")))
     assert not r.accepted and r.reason == "AUCTION_CLOSED"
 
@@ -292,10 +292,20 @@ def test_sorts_search_and_paging(seller, people):
                 break
         assert sorted(seen) == sorted([a["auctionId"], b["auctionId"], c["auctionId"]]), sort
 
-    # Closed auctions leave the "ending" index but stay in "newest".
+    # A closed auction stays on the browse pages for 15 minutes (listed after the
+    # live ones), then drops off every sort and search.
     repository.close_auction(b["auctionId"], at_ms=b["endsAt"])
-    assert b["auctionId"] not in ids(repository.list_auctions(sort="ending")[0])
-    assert b["auctionId"] in ids(repository.list_auctions(sort="newest")[0])
+    just_after = b["endsAt"] + 60_000
+    later = b["endsAt"] + 15 * 60_000 + 1
+    for sort in ("ending", "newest", "price_high"):
+        assert b["auctionId"] in ids(repository.list_auctions(sort=sort, at_ms=just_after)[0]), sort
+        assert b["auctionId"] not in ids(repository.list_auctions(sort=sort, at_ms=later)[0]), sort
+    assert ids(repository.list_auctions(sort="ending", at_ms=just_after)[0])[-1] == b["auctionId"]
+    assert ids(repository.list_auctions(sort="price_high", at_ms=just_after)[0])[-1] == b["auctionId"]
+    assert b["auctionId"] in ids(repository.list_auctions(query="painting", at_ms=just_after)[0])
+    assert repository.list_auctions(query="painting", at_ms=later)[0] == []
+    # It is still on the seller's profile.
+    assert b["auctionId"] in [x["auctionId"] for x in repository.auctions_by_seller(seller["userId"], include_cancelled=False)]
 
     status, body = call("GET", "/auctions", query={"sort": "ending", "limit": "1"})
     assert status == 200 and len(body["auctions"]) == 1 and body["nextCursor"]
@@ -645,3 +655,16 @@ def test_removal_emails_seller_and_leader(seller, people, sent):
     notify_handler.handler(_stream_event(before, state(a)), None)
     assert sent == [("seller@example.com", "Your listing was removed: Test item"),
                     ("alice@example.com", "An auction you were winning was removed: Test item")]
+
+
+def test_demo_addresses_are_never_emailed(monkeypatch):
+    calls = []
+    monkeypatch.setenv("NOTIFY_FROM", "BidBloom <alerts@bidbloom.test>")
+
+    class FakeSes:
+        def send_email(self, **kw):
+            calls.append(kw["Destination"])
+    monkeypatch.setattr("auction.config.ses_client", lambda: FakeSes())
+    notify._deliver(["judge.buyer@bidbloom.demo"], "s", "t", "h", cc=["real@gmail.com"])
+    notify._deliver(["judge.buyer@bidbloom.demo"], "s", "t", "h", cc=["seller@example.com"])
+    assert calls == [{"ToAddresses": ["real@gmail.com"]}]

@@ -10,6 +10,9 @@ applications:
             - npm ci
         build:
           commands:
+            # Console env vars exist only at build time; the SSR server reads
+            # API_INTERNAL_URL at request time, so hand it over via .env.production.
+            - env | grep -E '^API_INTERNAL_URL=' >> .env.production || true
             - npm run build
       artifacts:
         baseDirectory: .next

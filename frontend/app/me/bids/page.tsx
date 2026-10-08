@@ -30,7 +30,7 @@ export default function MyBidsPage() {
 function outcome(auction: Auction, userId: string, now: number | null): { text: string; tone: string } {
   const leading = auction.highBidderId === userId;
   const phase = livePhase(auction, now);
-  if (phase === "CANCELLED") return { text: "Cancelled", tone: "" };
+  if (phase === "CANCELLED") return { text: auction.removed ? "Removed" : "Cancelled", tone: "" };
   if (phase === "ENDED") {
     if (!auction.reserveMet) return { text: "Reserve not met", tone: "warn" };
     return leading ? { text: "Won", tone: "ok" } : { text: "Lost", tone: "bad" };

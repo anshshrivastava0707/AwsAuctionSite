@@ -51,7 +51,14 @@ function MySelling({ token }: { token: string }) {
                 return (
                   <tr key={a.auctionId}>
                     <td><Link href={`/auctions/${a.auctionId}`}>{a.title}</Link></td>
-                    <td><span className={`pill ${PHASE_PILL[a.phase]}`}>{PHASE_LABEL[a.phase]}</span></td>
+                    <td>
+                      {a.removed ? (
+                        <span className="pill closed" title={a.removedReason ?? undefined}>Removed by admin</span>
+                      ) : (
+                        <span className={`pill ${PHASE_PILL[a.phase]}`}>{PHASE_LABEL[a.phase]}</span>
+                      )}
+                      {a.removed && a.removedReason && <div className="hint">Reason: {a.removedReason}</div>}
+                    </td>
                     <td className="num">{a.currentHigh == null ? "—" : formatCents(a.currentHigh)}</td>
                     <td className="num">{a.bidCount}</td>
                     <td className="small">{formatDateTime(a.startsAt)}</td>

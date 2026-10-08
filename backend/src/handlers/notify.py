@@ -38,6 +38,9 @@ def handler(event, _context):
         old, new = _image(record, "OldImage"), _image(record, "NewImage")
         if not old or not new:
             continue
+        if new.get("removedAt") and not old.get("removedAt"):
+            notify.removed(new)
+            continue
         before, after = old.get("highBidderId"), new.get("highBidderId")
         if before and after != before and new["status"] in (OPEN, CLOSED):
             notify.outbid(new, before)

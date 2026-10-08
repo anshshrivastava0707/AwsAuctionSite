@@ -351,6 +351,8 @@ def public_auction(item: dict, at_ms: int | None = None) -> dict:
         # Offered only until the first bid.
         "buyNowPrice": item.get("buyNowPrice") if p in ("LIVE", "SCHEDULED") and not item.get("bidCount") else None,
         "soldVia": item.get("soldVia"),
+        # Taken down by an admin (the reason is only shown to the seller and admins).
+        "removed": bool(item.get("removedAt")),
         "watchCount": max(0, item.get("watchCount") or 0),
         "highBidderId": item.get("highBidderId"),
         "highBidderName": item.get("highBidderName"),
@@ -425,6 +427,13 @@ def parse_profile_update(body: Any, owner_id: str) -> dict:
     if not out:
         raise ValidationError("nothing to change")
     return out
+
+
+def parse_removal(body: Any) -> str:
+    """Why an admin took a listing down. Shown to the seller, so it must say something."""
+    if not isinstance(body, dict):
+        raise ValidationError("body must be a JSON object")
+    return _str(body.get("reason"), "reason", max_len=500)
 
 
 def parse_approval(body: Any) -> dict:

@@ -356,3 +356,4 @@ button.buy-now:hover:not(:disabled) { background: var(--accent-soft); }
 .auth-links { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 14px; color: var(--muted); }
 button.link { padding: 0; background: none; color: var(--link); font-weight: 500; border-radius: 0; }
 button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+.admin-bar { padding: 10px 12px; border: 1px dashed var(--bad); border-radius: 10px; }

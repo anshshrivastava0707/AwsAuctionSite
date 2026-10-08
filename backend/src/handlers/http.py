@@ -25,6 +25,7 @@ Logged in:
 Admin:
   GET  /admin/users?filter=pending|all
   POST /admin/users/{id}           {buyerStatus?, sellerStatus?}
+  POST /admin/auctions/{id}/remove {reason}   take down a listing (any state but cancelled)
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ from auction import auth, repository, schedules, storage, users
 from auction.errors import Conflict, Forbidden, NotFound
 from auction.models import (
     APPROVED, CATEGORIES, IMAGE_KEY_RE, ValidationError, new_auction_item, parse_approval, parse_auction_id,
+    parse_removal,
     parse_create_auction, parse_id, parse_profile_update, parse_registration, private_user, public_auction,
     public_bid, public_user,
 )
@@ -293,8 +295,8 @@ def my_auctions(req: Request):
     identity = req.require_identity()
     items = repository.auctions_by_seller(identity.user_id, include_cancelled=True)
     # Sellers see their own reserve (everyone else only learns whether it is met).
-    return _resp(200, {"auctions": [{**public_auction(a), "reservePrice": _int_or_none(a.get("reservePrice"))}
-                                    for a in items]})
+    return _resp(200, {"auctions": [{**public_auction(a), "reservePrice": _int_or_none(a.get("reservePrice")),
+                                     "removedReason": a.get("removedReason")} for a in items]})
 
 
 @route("GET", "/me/saved")
@@ -370,3 +372,13 @@ def admin_set_approval(req: Request, user_id: str):
     user = users.set_approval(parse_id(user_id, "userId"), parse_approval(req.json()))
     log.info("approval change for %s: buyer=%s seller=%s", user_id, user.get("buyerStatus"), user.get("sellerStatus"))
     return _resp(200, {"user": private_user(user, is_admin=user.get("email", "").lower() in auth.admin_emails())})
+
+
+@route("POST", "/admin/auctions/{auction_id}/remove")
+def admin_remove_auction(req: Request, auction_id: str):
+    identity = req.require_admin()
+    auction_id = parse_auction_id({"auctionId": auction_id})
+    item = repository.remove_auction(auction_id, identity.user_id, parse_removal(req.json()))
+    schedules.cancel_close(auction_id)
+    log.info("admin %s removed auction %s: %s", identity.email, auction_id, item.get("removedReason"))
+    return _resp(200, {"auction": {**public_auction(item), "removedReason": item.get("removedReason")}})

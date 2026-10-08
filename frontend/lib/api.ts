@@ -164,6 +164,10 @@ export async function uploadImage(token: string, file: File): Promise<string> {
 
 // ---------------------------------------------------------------- admin
 
+export const adminRemoveAuction = (token: string, id: string, reason: string) =>
+  request<{ auction: Auction }>(`/admin/auctions/${encodeURIComponent(id)}/remove`, { token, ...json("POST", { reason }) })
+    .then((r) => r.auction);
+
 export const adminListUsers = (token: string, filter: "pending" | "all") =>
   request<{ users: PrivateUser[] }>(`/admin/users?filter=${filter}`, { token }).then((r) => r.users);
 

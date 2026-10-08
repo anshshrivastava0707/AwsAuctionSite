@@ -98,7 +98,8 @@ Public: `GET /auctions?category=&sort=newest|ending|price_low|price_high&q=&curs
 Logged in: `GET|POST|PUT /me`, `POST /me/seller-request`, `GET /me/bids`, `GET /me/auctions`,
 `GET /me/saved`, `PUT|DELETE /me/saved/{id}`, `POST /uploads`, `POST /auctions`, `PATCH /auctions/{id}`,
 `POST /auctions/{id}/cancel`.
-Admin: `GET /admin/users?filter=pending|all`, `POST /admin/users/{id}`. See `backend/src/handlers/http.py`.
+Admin: `GET /admin/users?filter=pending|all`, `POST /admin/users/{id}`, `POST /admin/auctions/{id}/remove {reason}`
+(take down a listing that breaks the terms, in any state but cancelled; the seller and leading bidder are emailed). See `backend/src/handlers/http.py`.
 
 ## Backend
 

@@ -48,6 +48,10 @@ export interface Auction {
   /** Offered until the first bid; null otherwise. */
   buyNowPrice: number | null;
   soldVia: "BUY_NOW" | null;
+  /** Taken down by an admin. */
+  removed: boolean;
+  /** Why — only in the seller's own listings and admin replies. */
+  removedReason?: string | null;
   /** How many people saved this auction. */
   watchCount: number;
   /** Only in the seller's own listings (GET /me/auctions). */

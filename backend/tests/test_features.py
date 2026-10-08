@@ -507,3 +507,57 @@ def call_raw(path, query=None):
     from handlers import http
     return http.handler({"rawPath": path, "requestContext": {"http": {"method": "GET", "path": path}},
                          "headers": {}, "queryStringParameters": query, "body": None}, None)
+
+
+# --------------------------------------------------------------------------- admin takedown
+
+def admin_token():
+    from conftest import ADMIN_EMAIL
+    return auth.issue_dev_token(ADMIN_EMAIL)["token"]
+
+
+@pytest.mark.parametrize("when", ["live_with_bids", "upcoming", "ended"])
+def test_admin_can_remove_any_listing(seller, people, when):
+    a = make_auction(seller)
+    if when == "live_with_bids":
+        repository.place_bid(bid(a, 1000, people("alice")))
+    if when == "upcoming":
+        repository._auctions().update_item(Key={"auctionId": a["auctionId"]}, UpdateExpression="SET startsAt = :s",
+                                           ExpressionAttributeValues={":s": a["createdAt"] + 3_600_000})
+    if when == "ended":
+        repository.close_auction(a["auctionId"], at_ms=a["endsAt"])
+    status, body = call("POST", f"/admin/auctions/{a['auctionId']}/remove", {"reason": "Counterfeit item"},
+                        token=admin_token())
+    assert status == 200 and body["auction"]["removed"] and body["auction"]["phase"] == "CANCELLED"
+    assert body["auction"]["removedReason"] == "Counterfeit item"
+    # Gone from every listing, and from the public view of the reason.
+    for sort in ("newest", "ending"):
+        assert a["auctionId"] not in [x["auctionId"] for x in repository.list_auctions(sort=sort)[0]]
+    _, snap = call("GET", f"/auctions/{a['auctionId']}")
+    assert snap["auction"]["removed"] and "removedReason" not in snap["auction"]
+    # The seller sees why.
+    _, mine = call("GET", "/me/auctions", token=seller["token"])
+    assert mine["auctions"][0]["removedReason"] == "Counterfeit item"
+    r = repository.place_bid(bid(a, 5000, people("bob")))
+    assert not r.accepted and r.reason == "AUCTION_CLOSED"
+
+
+def test_remove_is_admin_only_needs_reason_and_happens_once(seller, people):
+    a = make_auction(seller)
+    path = f"/admin/auctions/{a['auctionId']}/remove"
+    assert call("POST", path, {"reason": "x"}, token=seller["token"])[0] == 403
+    assert call("POST", path, {"reason": "x"})[0] == 401
+    assert call("POST", path, {"reason": "  "}, token=admin_token())[0] == 400
+    assert call("POST", path, {"reason": "Spam"}, token=admin_token())[0] == 200
+    assert call("POST", path, {"reason": "Spam"}, token=admin_token())[0] == 409
+    assert call("POST", "/admin/auctions/nope/remove", {"reason": "Spam"}, token=admin_token())[0] == 404
+
+
+def test_removal_emails_seller_and_leader(seller, people, sent):
+    a = make_auction(seller)
+    repository.place_bid(bid(a, 1000, people("alice")))
+    before = state(a)
+    repository.remove_auction(a["auctionId"], "admin", "Prohibited item")
+    notify_handler.handler(_stream_event(before, state(a)), None)
+    assert sent == [("seller@example.com", "Your listing was removed: Test item"),
+                    ("alice@example.com", "An auction you were winning was removed: Test item")]

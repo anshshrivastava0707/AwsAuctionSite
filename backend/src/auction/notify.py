@@ -3,6 +3,8 @@
   outbid        to the previous leader, when someone takes the lead
   won / sold    to the winner and the seller when an auction closes
   ending soon   to everyone who saved or bid on a live auction, an hour before it ends
+  removed       to the seller (with the admin's reason) and the leading bidder, when an
+                admin takes a listing down
 
 Users can switch these off on their account (emailNotifications). With no
 NOTIFY_FROM configured, emails are only logged — handy locally and before SES
@@ -103,3 +105,18 @@ def ending_soon(auction: dict) -> None:
         else:
             lines = [f"“{auction['title']}” ends in about an hour. The current price is {price}."]
         send(user, f"Ending soon: {auction['title']}", lines, auction)
+
+
+def removed(auction: dict) -> None:
+    title = auction["title"]
+    seller = _recipient(auction.get("sellerId"))
+    if seller:
+        send(seller, f"Your listing was removed: {title}",
+             [f"An admin removed “{title}” because it doesn't meet our terms.",
+              f"Reason: {auction.get('removedReason') or 'not given'}",
+              "Any bids on it no longer stand. Reply to this email if you think this was a mistake."], auction)
+    leader = _recipient(auction.get("highBidderId"))
+    if leader:
+        send(leader, f"An auction you were winning was removed: {title}",
+             [f"“{title}” was removed by an admin because it doesn't meet our terms, so your bid no longer stands.",
+              "You won't be charged anything for it."], auction)

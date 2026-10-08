@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
-import { cancelAuction } from "@/lib/api";
+import { adminRemoveAuction, cancelAuction } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import {
   formatCents, formatDateTime, formatRemaining, livePhase, parseDollarsToCents, PHASE_LABEL, PHASE_PILL,
@@ -100,6 +100,24 @@ export default function LiveAuction({ initial }: { initial: Snapshot }) {
 
   const endingSoon = phase === "LIVE" && now != null && auction.endsAt - now < 2 * 60 * 1000;
 
+  async function onRemove() {
+    if (!token) return;
+    const reason = window.prompt(
+      "Remove this auction for breaking the terms?\n\nIt disappears from the site, any bids stop counting, and the seller " +
+      "and leading bidder are emailed. This can't be undone.\n\nReason (shown to the seller):",
+    );
+    if (reason == null) return;
+    if (!reason.trim()) return window.alert("Please give a reason; the seller will see it.");
+    setCancelling(true);
+    try {
+      await adminRemoveAuction(token, auction.auctionId, reason.trim());
+    } catch (err) {
+      window.alert(err instanceof Error ? err.message : "Could not remove");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   async function onCancel() {
     if (!token || !window.confirm("Cancel this auction? This can't be undone.")) return;
     setCancelling(true);
@@ -189,7 +207,23 @@ export default function LiveAuction({ initial }: { initial: Snapshot }) {
         ) : (
           <p className="notice warn">This auction ended below the seller&apos;s reserve price, so the item didn&apos;t sell.</p>
         ))}
-        {phase === "CANCELLED" && <p className="notice bad">The seller cancelled this auction.</p>}
+        {phase === "CANCELLED" && (
+          <p className="notice bad">
+            {auction.removed
+              ? "This auction was removed by BidBloom because it doesn't meet our terms. Any bids on it no longer stand."
+              : "The seller cancelled this auction."}
+          </p>
+        )}
+
+        {user?.isAdmin && phase !== "CANCELLED" && (
+          <div className="actions admin-bar">
+            <span className="hint">Admin</span>
+            <button className="danger small" onClick={onRemove} disabled={cancelling}>
+              {cancelling ? "Removing…" : "Remove auction"}
+            </button>
+            <span className="hint">For listings that break the terms. Works even after bids or after it ends.</span>
+          </div>
+        )}
 
         {canManage && (
           <div className="actions">

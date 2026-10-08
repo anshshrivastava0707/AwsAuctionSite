@@ -365,6 +365,31 @@ def cancel_auction(auction_id: str, user_id: str, *, is_admin: bool = False, at_
         raise
 
 
+def remove_auction(auction_id: str, admin_id: str, reason: str, *, at_ms: int | None = None) -> dict:
+    """Admin takedown (e.g. a listing that breaks the terms). Works in any state
+    except already cancelled — live, upcoming or ended — and hides the listing
+    everywhere, the same way a cancellation does. Bumping `version` means a bid
+    racing with the takedown fails its condition, re-plans and is rejected."""
+    at = at_ms if at_ms is not None else now_ms()
+    try:
+        return _auctions().update_item(
+            Key={"auctionId": auction_id},
+            UpdateExpression=("SET #status = :cancelled, removedAt = :now, removedBy = :admin, removedReason = :reason, "
+                              "#version = #version + :one, updatedAt = :now REMOVE openListing"),
+            ConditionExpression="attribute_exists(auctionId) AND #status <> :cancelled",
+            ExpressionAttributeNames={"#status": "status", "#version": "version"},
+            ExpressionAttributeValues={":cancelled": CANCELLED, ":now": at, ":admin": admin_id, ":reason": reason,
+                                       ":one": 1},
+            ReturnValues="ALL_NEW",
+        )["Attributes"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        if get_auction(auction_id) is None:
+            raise NotFound("Auction not found.") from e
+        raise Conflict("This auction has already been removed or cancelled.") from e
+
+
 # --------------------------------------------------------------------------- saves ("watching")
 
 def _saves():

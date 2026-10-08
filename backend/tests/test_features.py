@@ -442,9 +442,19 @@ def test_dev_login_disabled_in_cognito_mode(cognito, aws):
 
 @pytest.fixture
 def sent(monkeypatch):
-    out = []
-    monkeypatch.setattr(notify, "send", lambda user, subject, lines, auction: out.append((user["email"], subject)))
+    """Captured emails as (first To address, subject); full details in sent.raw."""
+    out = _SentList()
+    out.raw = []
+
+    def capture(to, subject, text, body_html, cc=None):
+        out.append((to[0], subject))
+        out.raw.append({"to": to, "cc": cc or [], "subject": subject, "text": text, "html": body_html})
+    monkeypatch.setattr(notify, "_deliver", capture)
     return out
+
+
+class _SentList(list):
+    raw: list
 
 
 def _stream_event(before, after):
@@ -469,13 +479,57 @@ def test_no_outbid_email_when_automatic_bid_defends(seller, people, sent):
     assert sent == []
 
 
-def test_close_emails_winner_and_seller(seller, people, sent):
+def test_sale_confirmation_goes_to_buyer_with_seller_cc(seller, people, sent):
     a = make_auction(seller)
     repository.place_bid(bid(a, 1000, people("alice")))
+    repository.place_bid(bid(a, 1500, people("bob")))
     before = state(a)
     repository.close_auction(a["auctionId"], at_ms=a["endsAt"])
     notify_handler.handler(_stream_event(before, state(a)), None)
-    assert sent == [("alice@example.com", "You won Test item!"), ("seller@example.com", "Sold: Test item")]
+    ref = notify.reference(a)
+    assert sent == [("bob@example.com", f"Sale confirmed: Test item for $15 ({ref})")]
+    mail = sent.raw[0]
+    assert mail["to"] == ["bob@example.com"] and mail["cc"] == ["seller@example.com"]
+    for fact in ("Test item", "$15", ref, "Good", "Highest bid, after 2 bids",
+                 "Seller <seller@example.com>", "Bob <bob@example.com>"):
+        assert fact in mail["text"], fact
+        assert html_unescape(fact) in html_unescape(mail["html"]), fact
+
+
+def html_unescape(s):
+    import html
+    return html.unescape(s)
+
+
+def test_sale_confirmation_is_sent_even_with_notifications_off(seller, people, sent):
+    from auction import users
+    a = make_auction(seller)
+    bob = people("bob")
+    users.update_profile(bob["userId"], {"emailNotifications": False})
+    users.update_profile(seller["userId"], {"emailNotifications": False})
+    repository.place_bid(bid(a, 1000, bob))
+    before = state(a)
+    repository.close_auction(a["auctionId"], at_ms=a["endsAt"])
+    notify_handler.handler(_stream_event(before, state(a)), None)
+    assert [m["cc"] for m in sent.raw] == [["seller@example.com"]]
+
+
+def test_buy_now_sale_confirmation_says_so(seller, people, sent):
+    a = make_auction(seller, buy_now=9000)
+    before = state(a)
+    repository.place_bid(bid(a, 9000, people("alice"), buyNow=True))
+    notify_handler.handler(_stream_event(before, state(a)), None)
+    assert len(sent.raw) == 1 and "Bought with Buy it now" in sent.raw[0]["text"]
+    assert sent.raw[0]["cc"] == ["seller@example.com"]
+
+
+def test_no_bids_emails_the_seller(seller, sent):
+    a = make_auction(seller)
+    before = state(a)
+    repository.close_auction(a["auctionId"], at_ms=a["endsAt"])
+    notify_handler.handler(_stream_event(before, state(a)), None)
+    assert sent == [("seller@example.com", "No bids on Test item")]
+    assert "nobody placed a bid" in sent.raw[0]["text"] and "/sell" in sent.raw[0]["text"]
 
 
 def test_close_below_reserve_emails_only_seller(seller, people, sent):

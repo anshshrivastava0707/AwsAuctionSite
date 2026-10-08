@@ -65,3 +65,18 @@ export const PHASE_PILL: Record<Phase, string> = {
   ENDED: "closed",
   CANCELLED: "closed",
 };
+
+/** Card countdown: "02:14:08" under a day, "3d 04h" beyond. */
+export function formatClock(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  if (d > 0) return `${d}d ${pad(h)}h`;
+  return `${pad(h)}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+}
+
+const usdWhole = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+
+/** "$240" for whole dollars, "$240.50" otherwise — for big display prices. */
+export const formatPrice = (cents: number) => (cents % 100 === 0 ? usdWhole.format(cents / 100) : formatCents(cents));

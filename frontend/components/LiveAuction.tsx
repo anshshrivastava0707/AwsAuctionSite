@@ -10,6 +10,7 @@ import {
 } from "@/lib/format";
 import { CATEGORIES, CONDITIONS, type Snapshot } from "@/lib/types";
 import { useAuctionSocket, type ConnStatus } from "@/lib/useAuctionSocket";
+import { useNow } from "@/lib/useNow";
 import Gallery from "./Gallery";
 
 const CONN_LABEL: Record<ConnStatus, string> = {
@@ -18,17 +19,6 @@ const CONN_LABEL: Record<ConnStatus, string> = {
   reconnecting: "Reconnecting…",
   unconfigured: "Not configured",
 };
-
-function useNow(intervalMs = 1000) {
-  // null until mounted, so server and client markup agree (no hydration mismatch).
-  const [now, setNow] = useState<number | null>(null);
-  useEffect(() => {
-    setNow(Date.now());
-    const t = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(t);
-  }, [intervalMs]);
-  return now;
-}
 
 export default function LiveAuction({ initial }: { initial: Snapshot }) {
   const { status: authStatus, token, user } = useAuth();

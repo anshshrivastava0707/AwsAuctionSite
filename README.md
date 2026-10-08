@@ -91,13 +91,11 @@ Approval is separate from login. After first login a user creates an account (`P
 (an email in `AdminEmails`) approves each role at `/admin`. Buyer status `APPROVED` is needed to bid; seller
 status `APPROVED` is needed to list. Admins are approved for both roles automatically.
 
-### Demo accounts for judges
+### Demo admin account for judges
 
-`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) four approved accounts
-with known passwords — two buyers, a seller and an admin — on `bidbloom.demo` addresses, which can't
-receive mail and are never emailed. Add `judge.admin@bidbloom.demo` to the stack's `AdminEmails` for the
-admin one to have admin rights. The script prints a `NEXT_PUBLIC_DEMO_ACCOUNTS` value; set it on a
-frontend deployment to list the accounts, with one-click login, on its login page.
+`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) an approved admin
+account with a known password, `judge.admin@bidbloom.demo` / `Judge-admin-2026`. Its address can't receive
+mail and is never emailed. Add it to the stack's `AdminEmails` for it to have admin rights.
 
 ## HTTP API
 

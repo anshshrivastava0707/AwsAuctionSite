@@ -1,36 +1,23 @@
-"""Create (or reset) ready-to-use demo accounts for judges and reviewers.
+"""Create (or reset) the demo admin account for judges.
 
     python scripts/create_demo_accounts.py --stack auction-backend-staging
 
-Each account is a confirmed Cognito user with a known password, plus a BidBloom
-account that is already approved, so it can log in and bid (or sell) at once.
-Safe to re-run: existing accounts get their password and approvals reset.
-
-The emails use the reserved demo domain `bidbloom.demo`, which can't receive mail;
-the notifier never sends to it. For the admin account to have admin rights, its
-email must also be in the stack's AdminEmails parameter.
-
-Prints the credentials, and the NEXT_PUBLIC_DEMO_ACCOUNTS value that makes the
-login page show them (set it only on deployments meant for judges).
+A confirmed Cognito user with a known password, plus a BidBloom account that is
+already approved to buy and sell. Safe to re-run: the password and approvals are
+reset. It uses the reserved demo domain `bidbloom.demo`, which can't receive mail;
+the notifier never sends to it. Its email must be in the stack's AdminEmails
+parameter for it to have admin rights.
 """
 from __future__ import annotations
 
 import argparse
-import json
 import time
 
 import boto3
 
 ACCOUNTS = [
-    # key, email, password, display name, seller?, note shown on the login page
-    ("buyer", "judge.buyer@bidbloom.demo", "Judge-buyer-2026", "Judge Buyer", False,
-     "Bid, use automatic bidding, save auctions"),
-    ("bidder2", "judge.bidder@bidbloom.demo", "Judge-bidder-2026", "Judge Bidder", False,
-     "A second buyer, to bid against the first"),
-    ("seller", "judge.seller@bidbloom.demo", "Judge-seller-2026", "Judge Seller", True,
-     "List auctions (with reserve / Buy it now) and edit them"),
-    ("admin", "judge.admin@bidbloom.demo", "Judge-admin-2026", "Judge Admin", True,
-     "Approve accounts and remove auctions"),
+    # email, password, display name
+    ("judge.admin@bidbloom.demo", "Judge-admin-2026", "Judge Admin"),
 ]
 
 
@@ -70,8 +57,7 @@ def main() -> None:
     admins = {e.strip().lower() for e in outputs["AdminEmails"].split(",") if e.strip()}
     table = boto3.resource("dynamodb", region_name=args.region).Table(users_table)
 
-    shown = []
-    for key, email, password, name, seller, note in ACCOUNTS:
+    for email, password, name in ACCOUNTS:
         user_id = ensure_cognito_user(cog, pool, email, password)
         now = int(time.time() * 1000)
         # Create the BidBloom account if missing, and (re)approve it either way.
@@ -83,17 +69,11 @@ def main() -> None:
                               "buyerStatus = :approved, sellerStatus = :seller, updatedAt = :now"),
             ExpressionAttributeNames={"#loc": "location"},
             ExpressionAttributeValues={":email": email, ":name": name, ":empty": "", ":none": None, ":now": now,
-                                       ":approved": "APPROVED", ":seller": "APPROVED" if seller else "NONE"},
+                                       ":approved": "APPROVED", ":seller": "APPROVED"},
         )
-        is_admin = email in admins
-        if key == "admin" and not is_admin:
+        print(f"  {email}  /  {password}")
+        if email not in admins:
             print(f"  note: {email} is not in AdminEmails, so it has no admin rights on this stack yet")
-        role = "admin" if is_admin else ("seller + buyer" if seller else "buyer")
-        print(f"  {role:15} {email:30} {password}")
-        if key != "admin" or is_admin:
-            shown.append({"label": name, "email": email, "password": password, "note": note})
-
-    print("\nNEXT_PUBLIC_DEMO_ACCOUNTS=" + json.dumps(shown, separators=(",", ":")))
 
 
 if __name__ == "__main__":

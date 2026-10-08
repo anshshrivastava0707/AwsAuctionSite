@@ -117,9 +117,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // sleeping tab wakes up (timers don't run while it sleeps).
   const tokenRef = useRef<string | null>(null);
   tokenRef.current = token;
+  const loadedRef = useRef(false);
   const syncSession = useCallback(async () => {
     const s = await freshSession(readSession());
-    if ((s?.token ?? null) !== tokenRef.current) await load(s?.token ?? null);
+    const next = s?.token ?? null;
+    // Always load the first time (even with no session: that's what moves us out of
+    // "loading" to "anonymous"); afterwards only when the token actually changed.
+    if (!loadedRef.current || next !== tokenRef.current) {
+      loadedRef.current = true;
+      await load(next);
+    }
   }, [load]);
 
   useEffect(() => {

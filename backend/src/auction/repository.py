@@ -140,8 +140,9 @@ def _keyed_page(index: str, key, *, limit: int, cursor: dict | None, key_attrs: 
     """One page from an index. The cursor is rebuilt from the last item we return
     (not DynamoDB's LastEvaluatedKey), because the filter means we may stop
     part-way through a DynamoDB page."""
-    kwargs: dict = {"IndexName": index, "KeyConditionExpression": key, "ScanIndexForward": forward,
-                    "FilterExpression": filter_expr}
+    kwargs: dict = {"IndexName": index, "KeyConditionExpression": key, "ScanIndexForward": forward}
+    if filter_expr is not None:
+        kwargs["FilterExpression"] = filter_expr
     if cursor:
         kwargs["ExclusiveStartKey"] = cursor
     items: list[dict] = []
@@ -188,11 +189,12 @@ def list_auctions(category: str | None = None, limit: int = 50, *, sort: str = "
         return _keyed_page(index, key, limit=limit, cursor=_decode_cursor(cursor), key_attrs=attrs,
                            forward=False, filter_expr=not_cancelled)
 
+    # endsAt is the byEnding sort key, and DynamoDB doesn't allow filters on key
+    # attributes, so "not ended yet" goes in the key condition.
+    still_open = Key("openListing").eq(OPEN_LISTING) & Key("endsAt").gt(at)
     if not words and sort == "ending":
-        f = Attr("endsAt").gt(at)
-        if category:
-            f = f & Attr("category").eq(category)
-        return _keyed_page("byEnding", Key("openListing").eq(OPEN_LISTING), limit=limit,
+        f = Attr("category").eq(category) if category else None
+        return _keyed_page("byEnding", still_open, limit=limit,
                            cursor=_decode_cursor(cursor), key_attrs=("auctionId", "openListing", "endsAt"),
                            forward=True, filter_expr=f)
 
@@ -207,11 +209,9 @@ def list_auctions(category: str | None = None, limit: int = 50, *, sort: str = "
             f = f & Attr("openListing").exists()
         items = _scan(f)
     else:
-        f = Attr("endsAt").gt(at)
-        if category:
-            f = f & Attr("category").eq(category)
+        kwargs = {"FilterExpression": Attr("category").eq(category)} if category else {}
         items = _query(_auctions(), MAX_SCAN_RESULTS, max_pages=50, IndexName="byEnding",
-                       KeyConditionExpression=Key("openListing").eq(OPEN_LISTING), FilterExpression=f)
+                       KeyConditionExpression=still_open, **kwargs)
     if sort == "newest":
         items.sort(key=lambda a: -int(a["createdAt"]))
     elif sort == "ending":

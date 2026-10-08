@@ -235,6 +235,36 @@ def test_early_bid_does_not_extend(seller, people):
 
 # --------------------------------------------------------------------------- browsing
 
+@pytest.fixture
+def strict_filters(monkeypatch):
+    """Real DynamoDB rejects a FilterExpression on a table or index key attribute;
+    moto doesn't. Enforce it here so listing queries can't regress."""
+    from boto3.dynamodb.conditions import ConditionExpressionBuilder
+    keys = {"auctionId", "listing", "category", "sellerId", "createdAt", "openListing", "endsAt"}
+    index_keys = {"byListing": {"listing", "createdAt"}, "byCategory": {"category", "createdAt"},
+                  "bySeller": {"sellerId", "createdAt"}, "byEnding": {"openListing", "endsAt"}}
+    real = repository._auctions
+
+    class Checked:
+        def __init__(self, table):
+            self.table = table
+
+        def query(self, **kw):
+            if "FilterExpression" in kw:
+                names = ConditionExpressionBuilder().build_expression(kw["FilterExpression"]).attribute_name_placeholders
+                used = set(names.values())
+                bad = used & (index_keys.get(kw.get("IndexName"), set()) | {"auctionId"})
+                assert not bad, f"filter on key attribute(s) {bad} would fail on real DynamoDB"
+            return self.table.query(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self.table, name)
+
+    monkeypatch.setattr(repository, "_auctions", lambda: Checked(real()))
+    return keys
+
+
+@pytest.mark.usefixtures("strict_filters")
 def test_sorts_search_and_paging(seller, people):
     now = int(time.time() * 1000)
     a = make_auction(seller, title="Vintage film camera", category="ELECTRONICS", ends_in=3_600_000, at=now - 3000)

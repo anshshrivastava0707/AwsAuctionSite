@@ -290,8 +290,11 @@ def test_edit_end_time_moves_close_schedule(auction, seller):
         assert sched.delete_schedule.called
 
 
-def test_close_job_ignores_schedule_for_moved_end_time(auction):
-    assert scheduler.handler({"auctionId": auction["auctionId"]}, None) == {"closed": False, "rescheduled": True}
+def test_close_job_reschedules_when_end_moved_later(auction):
+    # Fired at the original end, but the auction now ends later (an edit, or a
+    # late bid extended it): don't close, re-schedule for the new end instead.
+    assert scheduler.handler({"auctionId": auction["auctionId"]}, None) == {
+        "closed": False, "rescheduled": auction["endsAt"]}
 
 
 # --------------------------------------------------------------------------- history

@@ -5,9 +5,10 @@ user id sent by the client. The *source* of identities is pluggable via AUTH_MOD
 
   dev      Built in. POST /auth/dev-login {email} returns an HMAC-signed token.
            No passwords: anyone can log in as any email. For local work and demos only.
-  cognito  NOT IMPLEMENTED YET. Sign-up, login, password reset and email verification
-  supabase come from the provider; `_provider_identity` must verify the provider's JWT
-           and map it to an Identity (user_id = the token's `sub`, plus `email`).
+  cognito  Sign-up, login, password reset and email verification happen in an Amazon
+           Cognito user pool (the browser talks to Cognito directly). The client sends
+           the Cognito *ID token*; we verify its RS256 signature against the pool's
+           JWKS plus iss / aud / token_use / exp, and require a verified email.
 
 Account *approval* (buyer / seller) is not the provider's job — it lives on our
 Users table (auction/users.py) and is granted by admins, whatever the provider.
@@ -21,6 +22,8 @@ import json
 import logging
 import os
 import re
+import time
+import urllib.request
 from dataclasses import dataclass
 
 from .models import ValidationError, now_ms
@@ -118,10 +121,79 @@ def _dev_identity(token: str) -> Identity | None:
         return None
 
 
-# --------------------------------------------------------------------------- real providers
+# --------------------------------------------------------------------------- Cognito
+
+# SHA-256 DigestInfo prefix for EMSA-PKCS1-v1_5 (RFC 8017 section 9.2).
+_SHA256_PREFIX = bytes.fromhex("3031300d060960864801650304020105000420")
+_JWKS_TTL_S = 3600
+_jwks_cache: dict = {"keys": {}, "fetched": 0.0}
+CLOCK_SKEW_S = 60
+
+
+def _cognito_issuer() -> str:
+    pool = os.environ.get("COGNITO_USER_POOL_ID", "")
+    if not pool:
+        raise AuthNotConfigured("COGNITO_USER_POOL_ID must be set for AUTH_MODE=cognito")
+    region = pool.split("_", 1)[0]
+    return f"https://cognito-idp.{region}.amazonaws.com/{pool}"
+
+
+def _fetch_jwks(issuer: str) -> dict:
+    with urllib.request.urlopen(f"{issuer}/.well-known/jwks.json", timeout=5) as r:
+        return json.loads(r.read())
+
+
+def _signing_key(kid: str) -> dict | None:
+    """Keys are cached for an hour; an unknown kid (key rotation) forces one refetch."""
+    now = time.time()
+    age = now - _jwks_cache["fetched"]
+    # Refetch when stale, or for an unknown kid, but at most every 10 s so tokens
+    # with made-up kids can't make us hammer Cognito.
+    if age > _JWKS_TTL_S or (kid not in _jwks_cache["keys"] and age > 10):
+        _jwks_cache["keys"] = {k["kid"]: k for k in _fetch_jwks(_cognito_issuer()).get("keys", [])}
+        _jwks_cache["fetched"] = now
+    return _jwks_cache["keys"].get(kid)
+
+
+def _rsa_sha256_verify(n: int, e: int, message: bytes, signature: bytes) -> bool:
+    """RSASSA-PKCS1-v1_5 verification. Only public-key operations, so plain
+    integer arithmetic is safe here (nothing secret to leak through timing)."""
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    em = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
+    digest = _SHA256_PREFIX + hashlib.sha256(message).digest()
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest) - 3) + b"\x00" + digest
+    return hmac.compare_digest(em, expected)
+
 
 def _provider_identity(token: str) -> Identity | None:
-    # Plug Cognito / Supabase in here: verify the JWT signature against the
-    # provider's JWKS, check `exp`, `iss` and `aud`, then return
-    # Identity(user_id=claims["sub"], email=claims["email"]).
-    raise AuthNotConfigured(f"AUTH_MODE={mode()!r} is not implemented yet")
+    if mode() != "cognito":
+        raise AuthNotConfigured(f"AUTH_MODE={mode()!r} is not supported")
+    client_id = os.environ.get("COGNITO_CLIENT_ID", "")
+    if not client_id:
+        raise AuthNotConfigured("COGNITO_CLIENT_ID must be set for AUTH_MODE=cognito")
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+        header = json.loads(_unb64(header_b64))
+        if header.get("alg") != "RS256":
+            return None
+        jwk = _signing_key(str(header.get("kid")))
+        if jwk is None or jwk.get("kty") != "RSA":
+            return None
+        n = int.from_bytes(_unb64(jwk["n"]), "big")
+        e = int.from_bytes(_unb64(jwk["e"]), "big")
+        if not _rsa_sha256_verify(n, e, f"{header_b64}.{payload_b64}".encode(), _unb64(sig_b64)):
+            return None
+        claims = json.loads(_unb64(payload_b64))
+        now = time.time()
+        if (claims.get("iss") != _cognito_issuer() or claims.get("token_use") != "id"
+                or claims.get("aud") != client_id or float(claims["exp"]) <= now - CLOCK_SKEW_S
+                or float(claims.get("iat", 0)) > now + CLOCK_SKEW_S):
+            return None
+        # Admin rights hang off the email, so it must be one the user proved they own.
+        if claims.get("email_verified") not in (True, "true") or not claims.get("email"):
+            return None
+        return Identity(user_id=claims["sub"], email=str(claims["email"]).lower())
+    except (ValueError, KeyError, TypeError):
+        return None

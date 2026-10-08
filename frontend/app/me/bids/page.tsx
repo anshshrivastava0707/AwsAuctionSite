@@ -7,6 +7,7 @@ import { getMyBids } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { formatCents, formatDateTime, formatRemaining, livePhase, PHASE_LABEL, PHASE_PILL } from "@/lib/format";
 import type { Auction, BidHistoryEntry, PrivateUser } from "@/lib/types";
+import { useNow } from "@/lib/useNow";
 import { type AlertKind, useWatchAuctions } from "@/lib/useWatchAuctions";
 
 const CONN_LABEL = { connecting: "Connecting…", live: "Live", reconnecting: "Reconnecting…", unconfigured: "Not configured" };
@@ -15,29 +16,25 @@ const ALERT_TEXT: Record<AlertKind, (title: string, amount: string) => string> =
   OUTBID: (t, amt) => `You were outbid on "${t}" — the high bid is now ${amt}.`,
   WON: (t) => `You won "${t}"!`,
   LOST: (t) => `"${t}" has ended — someone else won.`,
+  RESERVE_NOT_MET: (t) => `"${t}" ended below the seller's reserve, so it didn't sell.`,
   CANCELLED: (t) => `"${t}" was cancelled.`,
 };
-const ALERT_TONE: Record<AlertKind, string> = { OUTBID: "bad", WON: "ok", LOST: "warn", CANCELLED: "warn" };
+const ALERT_TONE: Record<AlertKind, string> = {
+  OUTBID: "bad", WON: "ok", LOST: "warn", RESERVE_NOT_MET: "warn", CANCELLED: "warn",
+};
 
 export default function MyBidsPage() {
   return <RequireAccount>{(user, token) => <MyBids user={user} token={token} />}</RequireAccount>;
-}
-
-function useNow(intervalMs = 1000) {
-  const [now, setNow] = useState<number | null>(null);
-  useEffect(() => {
-    setNow(Date.now());
-    const t = setInterval(() => setNow(Date.now()), intervalMs);
-    return () => clearInterval(t);
-  }, [intervalMs]);
-  return now;
 }
 
 function outcome(auction: Auction, userId: string, now: number | null): { text: string; tone: string } {
   const leading = auction.highBidderId === userId;
   const phase = livePhase(auction, now);
   if (phase === "CANCELLED") return { text: "Cancelled", tone: "" };
-  if (phase === "ENDED") return leading ? { text: "Won", tone: "ok" } : { text: "Lost", tone: "bad" };
+  if (phase === "ENDED") {
+    if (!auction.reserveMet) return { text: "Reserve not met", tone: "warn" };
+    return leading ? { text: "Won", tone: "ok" } : { text: "Lost", tone: "bad" };
+  }
   return leading ? { text: "Winning", tone: "ok" } : { text: "Outbid", tone: "bad" };
 }
 
@@ -56,9 +53,9 @@ function MyBids({ user, token }: { user: PrivateUser; token: string }) {
 
   // Unread alerts show in the tab title, so an outbid is noticed from another tab.
   useEffect(() => {
-    const base = "My bids · Live Auctions";
+    const base = "My bids · BidBloom";
     document.title = alerts.length ? `(${alerts.length}) ${alerts[0].kind === "OUTBID" ? "Outbid!" : "Update"} · ${base}` : base;
-    return () => { document.title = "Live Auctions"; };
+    return () => { document.title = "BidBloom"; };
   }, [alerts]);
 
   const flagged = new Set(alerts.map((a) => a.auctionId));
@@ -97,7 +94,7 @@ function MyBids({ user, token }: { user: PrivateUser; token: string }) {
         <div className="table-wrap">
           <table className="data">
             <thead>
-              <tr><th>Auction</th><th>Your highest bid</th><th>Current high</th><th>Time left</th><th>Your bids</th><th>Result</th></tr>
+              <tr><th>Auction</th><th>Your highest bid</th><th>Your maximum</th><th>Current high</th><th>Time left</th><th>Your bids</th><th>Result</th></tr>
             </thead>
             <tbody>
               {entries.map((e) => {
@@ -112,6 +109,9 @@ function MyBids({ user, token }: { user: PrivateUser; token: string }) {
                       <span className={`pill ${PHASE_PILL[phase]}`}>{PHASE_LABEL[phase]}</span>
                     </td>
                     <td className="num">{formatCents(mine)}</td>
+                    <td className="num" title="Automatic bidding goes up to this. Only you can see it.">
+                      {e.myMax != null && e.myMax > mine ? formatCents(e.myMax) : "—"}
+                    </td>
                     <td className="num">
                       {formatCents(a.currentHigh)}
                       {a.highBidderId && a.highBidderId !== user.userId && <span className="muted small"> by {a.highBidderName}</span>}

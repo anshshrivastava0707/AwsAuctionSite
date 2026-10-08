@@ -8,6 +8,7 @@ The real Lambda handlers run unchanged. Only the AWS pieces around them are stoo
   - HTTP API              -> a small http.server that builds API Gateway v2 events
   - WebSocket API         -> a `websockets` server; postToConnection writes to the local socket
   - DynamoDB Stream       -> a poller that diffs the Auctions table and feeds stream.handler
+                             and notify.handler (emails are logged, not sent)
   - EventBridge Scheduler -> the same poller closes auctions once endsAt has passed
   - S3 (images)           -> a temp directory; uploads are signed PUTs to /local-upload/<key>
   - Login                 -> AUTH_MODE=dev. Log in as --admin-email to approve other accounts.
@@ -61,6 +62,7 @@ from auction import config, connections, repository, storage  # noqa: E402
 from auction.models import IMAGE_KEY_RE, now_ms  # noqa: E402
 from devtools import tables  # noqa: E402
 from handlers import http as http_handler  # noqa: E402
+from handlers import notify as notify_handler  # noqa: E402
 from handlers import stream as stream_handler  # noqa: E402
 from handlers import ws as ws_handler  # noqa: E402
 
@@ -215,6 +217,8 @@ def stream_and_scheduler_loop(interval: float = 0.1) -> None:
                         log.info("closed auction %s", aid)
             if records:
                 stream_handler.handler({"Records": records}, None)
+                # Without NOTIFY_FROM the emails are only logged, which is what we want locally.
+                notify_handler.handler({"Records": records}, None)
         except Exception:
             log.exception("stream poller error")
         time.sleep(interval)

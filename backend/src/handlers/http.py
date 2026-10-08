@@ -2,11 +2,12 @@
 module routes by method + path, so adding an endpoint never touches the template.
 
 Public (no login):
-  GET  /auctions?category=X        newest first
+  GET  /auctions?category=&sort=newest|ending|price_low|price_high&q=&cursor=&limit=
+                                   one page + nextCursor
   GET  /auctions/{id}              snapshot (strongly consistent) — used by page loads
   GET  /users/{id}                 public profile
   GET  /users/{id}/auctions        a seller's listings
-  GET  /images/{key}               redirect to the stored image
+  GET  /images/{key}?size=thumb    redirect to the stored image (or its thumbnail)
   POST /auth/dev-login             AUTH_MODE=dev only
 
 Logged in:
@@ -14,6 +15,8 @@ Logged in:
   POST /me/seller-request
   GET  /me/bids                    bidding history, grouped by auction
   GET  /me/auctions                my listings, including cancelled
+  GET  /me/saved                   saved ("watched") auctions, most recently saved first
+  PUT  /me/saved/{id}  DELETE /me/saved/{id}
   POST /uploads                    signed upload for one image
   POST /auctions                   approved sellers only
   PATCH /auctions/{id}             seller, before the first bid
@@ -46,6 +49,10 @@ class HttpError(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def _int_or_none(value) -> int | None:
+    return None if value is None else int(value)
 
 
 def _resp(status: int, body=None, headers: dict | None = None) -> dict:
@@ -159,7 +166,17 @@ def list_auctions(req: Request):
     category = req.query.get("category") or None
     if category is not None and category not in CATEGORIES:
         raise ValidationError("unknown category")
-    return _resp(200, {"auctions": [public_auction(a) for a in repository.list_auctions(category)]})
+    sort = req.query.get("sort") or "newest"
+    if sort not in repository.SORTS:
+        raise ValidationError(f"sort must be one of {', '.join(repository.SORTS)}")
+    try:
+        limit = min(max(int(req.query.get("limit") or repository.PAGE_SIZE), 1), 100)
+    except ValueError:
+        raise ValidationError("limit must be a number")
+    query = (req.query.get("q") or "")[:200]
+    items, cursor = repository.list_auctions(category, limit, sort=sort, query=query,
+                                             cursor=req.query.get("cursor"))
+    return _resp(200, {"auctions": [public_auction(a) for a in items], "nextCursor": cursor})
 
 
 @route("POST", "/auctions")
@@ -172,6 +189,7 @@ def create_auction(req: Request):
     item = new_auction_item(data, user)
     repository.create_auction(item)
     schedules.schedule_close(item["auctionId"], item["endsAt"])
+    schedules.schedule_reminder(item["auctionId"], item["endsAt"], item["createdAt"])
     return _resp(201, {"auction": public_auction(item)})
 
 
@@ -193,6 +211,7 @@ def edit_auction(req: Request, auction_id: str):
     item, changes = repository.update_auction(auction_id, identity.user_id, body)
     if "endsAt" in changes:
         schedules.schedule_close(auction_id, int(item["endsAt"]))
+        schedules.schedule_reminder(auction_id, int(item["endsAt"]), int(item["updatedAt"]))
     return _resp(200, {"auction": public_auction(item)})
 
 
@@ -245,13 +264,27 @@ def seller_request(req: Request):
 @route("GET", "/me/bids")
 def my_bids(req: Request):
     identity = req.require_identity()
-    bids = repository.bids_by_bidder(identity.user_id)
+    rows = repository.bids_by_bidder(identity.user_id)
     by_auction: dict[str, list[dict]] = {}
-    for b in bids:  # newest first
-        by_auction.setdefault(b["auctionId"], []).append(public_bid(b))
+    my_max: dict[str, int] = {}
+    for b in rows:  # newest first
+        aid = b["auctionId"]
+        by_auction.setdefault(aid, [])
+        if "maxAmount" in b:
+            my_max[aid] = max(my_max.get(aid, 0), int(b["maxAmount"]))
+        if "amount" in b:  # rows without one only record a raised maximum
+            by_auction[aid].append(public_bid(b))
     auctions = repository.get_auctions(list(by_auction))
-    entries = [{"auction": public_auction(auctions[aid]), "bids": bs}
-               for aid, bs in by_auction.items() if aid in auctions]
+    entries = []
+    for aid, bs in by_auction.items():
+        if aid not in auctions:
+            continue
+        auction = auctions[aid]
+        # Your automatic-bidding ceiling is private to you, and only matters while you lead.
+        leading = auction.get("highBidderId") == identity.user_id
+        entries.append({"auction": public_auction(auction), "bids": bs,
+                        "myMax": int(auction["proxyMax"]) if leading and auction.get("proxyMax") is not None
+                        else my_max.get(aid)})
     return _resp(200, {"entries": entries})
 
 
@@ -259,7 +292,31 @@ def my_bids(req: Request):
 def my_auctions(req: Request):
     identity = req.require_identity()
     items = repository.auctions_by_seller(identity.user_id, include_cancelled=True)
-    return _resp(200, {"auctions": [public_auction(a) for a in items]})
+    # Sellers see their own reserve (everyone else only learns whether it is met).
+    return _resp(200, {"auctions": [{**public_auction(a), "reservePrice": _int_or_none(a.get("reservePrice"))}
+                                    for a in items]})
+
+
+@route("GET", "/me/saved")
+def my_saved(req: Request):
+    identity = req.require_identity()
+    ids = repository.saved_ids(identity.user_id)
+    found = repository.get_auctions(ids)
+    return _resp(200, {"auctions": [public_auction(found[i]) for i in ids if i in found]})
+
+
+@route("PUT", "/me/saved/{auction_id}")
+def save_auction(req: Request, auction_id: str):
+    identity = req.require_identity()
+    repository.set_saved(identity.user_id, parse_auction_id({"auctionId": auction_id}), True)
+    return _resp(200, {"saved": True})
+
+
+@route("DELETE", "/me/saved/{auction_id}")
+def unsave_auction(req: Request, auction_id: str):
+    identity = req.require_identity()
+    repository.set_saved(identity.user_id, parse_auction_id({"auctionId": auction_id}), False)
+    return _resp(200, {"saved": False})
 
 
 @route("POST", "/uploads")
@@ -289,6 +346,10 @@ def user_auctions(req: Request, user_id: str):
 def get_image(req: Request, key: str):
     if not IMAGE_KEY_RE.match(key):
         raise NotFound("Image not found.")
+    if req.query.get("size") == "thumb":
+        # Made by the thumbnail function shortly after upload. Not checked here (that
+        # would cost a request per image); the page falls back to the original.
+        key = storage.thumb_key(key)
     return {"statusCode": 302, "headers": {"Location": storage.backend.download_url(key),
                                            "Cache-Control": "private, max-age=600"}, "body": ""}
 

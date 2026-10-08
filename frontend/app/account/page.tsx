@@ -49,6 +49,14 @@ function Account({ user, token }: { user: PrivateUser; token: string }) {
     }
   }
 
+  async function setEmails(on: boolean) {
+    try {
+      setUser(await updateProfile(token, { emailNotifications: on }));
+    } catch (err) {
+      setMessage({ ok: false, text: err instanceof Error ? err.message : "Could not save" });
+    }
+  }
+
   async function askSeller() {
     try {
       setUser(await requestSellerAccess(token));
@@ -106,8 +114,14 @@ function Account({ user, token }: { user: PrivateUser; token: string }) {
         )}
         {user.isAdmin && <p className="small muted">You are an admin. <Link href="/admin">Review accounts</Link></p>}
         <p className="small muted">An admin reviews each role. You will be able to bid or list once approved.</p>
+        <h2 style={{ marginTop: 12 }}>Email notifications</h2>
+        <label className="check">
+          <input type="checkbox" checked={user.emailNotifications} onChange={(e) => void setEmails(e.target.checked)} />
+          Email me when I&apos;m outbid, when I win, when my items sell, and an hour before saved auctions end
+        </label>
         <div className="actions">
           <Link href="/me/bids">My bidding history</Link>
+          <Link href="/me/saved">Saved auctions</Link>
           {user.sellerStatus === "APPROVED" && <Link href="/me/selling">Items I&apos;m selling</Link>}
         </div>
       </section>

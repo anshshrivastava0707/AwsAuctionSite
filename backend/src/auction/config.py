@@ -25,6 +25,10 @@ def users_table_name() -> str:
     return os.environ["USERS_TABLE"]
 
 
+def saves_table_name() -> str:
+    return os.environ["SAVES_TABLE"]
+
+
 def images_bucket() -> str:
     return os.environ.get("IMAGES_BUCKET", "")
 
@@ -50,6 +54,11 @@ def scheduler_client():
 
 
 @lru_cache(maxsize=None)
+def ses_client():
+    return boto3.client("sesv2")
+
+
+@lru_cache(maxsize=None)
 def apigw_management_client(endpoint_url: str):
     return boto3.client("apigatewaymanagementapi", endpoint_url=endpoint_url)
 
@@ -60,4 +69,5 @@ def reset_clients() -> None:
     dynamodb_resource.cache_clear()
     scheduler_client.cache_clear()
     s3_client.cache_clear()
+    ses_client.cache_clear()
     apigw_management_client.cache_clear()

@@ -24,6 +24,7 @@ export default function Header() {
             <>
               {user.sellerStatus === "APPROVED" && link("/sell", "Sell")}
               {link("/me/bids", "My bids")}
+              {link("/me/saved", "Saved")}
               {user.sellerStatus === "APPROVED" && link("/me/selling", "Selling")}
               {user.isAdmin && link("/admin", "Admin")}
             </>

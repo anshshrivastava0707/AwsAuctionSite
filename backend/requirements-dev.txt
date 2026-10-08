@@ -4,3 +4,4 @@ moto[dynamodb]
 pytest
 cfn-lint
 websockets
+Pillow  # only for testing thumbs/ (that function ships its own requirements.txt)

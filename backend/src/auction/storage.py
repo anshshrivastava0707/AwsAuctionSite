@@ -63,6 +63,11 @@ def create_upload(user_id: str, content_type: object, size: object) -> dict:
     return {"key": key, **backend.presign_upload(key, content_type)}
 
 
+def thumb_key(key: str) -> str:
+    """uploads/<user>/<id>.<ext> -> thumbs/<user>/<id>.webp (see handlers/thumbs)."""
+    return "thumbs/" + key.removeprefix("uploads/").rsplit(".", 1)[0] + ".webp"
+
+
 def require_uploaded(keys: list[str]) -> None:
     for key in keys:
         if not backend.exists(key):

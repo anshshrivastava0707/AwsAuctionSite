@@ -42,6 +42,16 @@ export interface Auction {
   minIncrement: number;
   minNextBid: number;
   currentHigh: number | null;
+  /** The reserve amount itself is secret; bidders only see whether it is met. */
+  hasReserve: boolean;
+  reserveMet: boolean;
+  /** Offered until the first bid; null otherwise. */
+  buyNowPrice: number | null;
+  soldVia: "BUY_NOW" | null;
+  /** How many people saved this auction. */
+  watchCount: number;
+  /** Only in the seller's own listings (GET /me/auctions). */
+  reservePrice?: number | null;
   highBidderId: string | null;
   highBidderName: string | null;
   bidCount: number;
@@ -63,6 +73,8 @@ export interface Bid {
   bidderName: string;
   amount: number;
   placedAt: number;
+  /** Placed automatically for a bidder up to their maximum. */
+  auto?: boolean;
 }
 
 export interface Snapshot {
@@ -86,12 +98,22 @@ export interface PrivateUser extends PublicUser {
   email: string;
   buyerStatus: ApprovalStatus;
   sellerStatus: ApprovalStatus;
+  emailNotifications: boolean;
   isAdmin: boolean;
 }
 
 export interface BidHistoryEntry {
   auction: Auction;
   bids: Bid[]; // my bids on this auction, newest first
+  /** My automatic-bidding maximum, if I set one. Private to me. */
+  myMax: number | null;
+}
+
+export type SortKey = "newest" | "ending" | "price_low" | "price_high";
+
+export interface AuctionPage {
+  auctions: Auction[];
+  nextCursor: string | null;
 }
 
 export type ListingInput = {
@@ -103,6 +125,8 @@ export type ListingInput = {
   images: string[];
   startingPrice: number;
   minIncrement: number;
+  reservePrice: number | null;
+  buyNowPrice: number | null;
   startsAt: number;
   endsAt: number;
 };
@@ -122,11 +146,14 @@ export type RejectReason =
   | "OWN_AUCTION"
   | "TERMS_CHANGED"
   | "NOT_APPROVED"
-  | "NOT_AUTHENTICATED";
+  | "NOT_AUTHENTICATED"
+  | "ALREADY_LEADING"
+  | "BUY_NOW_UNAVAILABLE";
 
 export type ServerMessage =
   | ({ type: "snapshot" } & Snapshot)
-  | { type: "auctionUpdate"; auction: Auction; bid?: Bid }
+  /** `bids`: every bid row the commit wrote (automatic bids included). `bid`: the new high only (older servers). */
+  | { type: "auctionUpdate"; auction: Auction; bid?: Bid; bids?: Bid[] }
   | {
       type: "bidResult";
       bidId: string;
@@ -136,6 +163,11 @@ export type ServerMessage =
       duplicate: boolean;
       auction: Auction | null;
       bid: Bid | null;
+      /** Accepted bids: do I lead now? (An automatic bid may answer at once.) */
+      leading?: boolean;
+      yourMax?: number;
+      /** A last-minute bid pushed the end out to this time. */
+      extendedTo?: number;
     }
   | { type: "watching"; auctions: Auction[] }
   | { type: "pong"; auctionId?: string; version?: number }
@@ -147,4 +179,6 @@ export interface PlaceBidMessage {
   bidId: string;
   amount: number;
   termsVersion: number;
+  maxAmount?: number;
+  buyNow?: boolean;
 }

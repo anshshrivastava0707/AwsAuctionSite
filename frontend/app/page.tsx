@@ -1,9 +1,9 @@
 import Link from "next/link";
-import AuctionGrid from "@/components/AuctionGrid";
+import AuctionList from "@/components/AuctionList";
 import Dropdown from "@/components/Dropdown";
 import { ChevronDown, ClockIcon, SearchIcon } from "@/components/icons";
-import { listAuctions } from "@/lib/api";
-import { CATEGORIES, type Auction, type Category } from "@/lib/types";
+import { listAuctions, type AuctionQuery } from "@/lib/api";
+import { CATEGORIES, type AuctionPage, type Category, type SortKey } from "@/lib/types";
 
 // Always render from the database at request time.
 export const dynamic = "force-dynamic";
@@ -14,41 +14,13 @@ const MORE = (Object.keys(CATEGORIES) as Category[]).filter((c) => !PRIMARY.incl
 const CHIP_LABEL: Partial<Record<Category, string>> = { HOME_GARDEN: "Home" };
 const chipLabel = (c: Category) => CHIP_LABEL[c] ?? CATEGORIES[c];
 
-const SORTS = {
+const SORTS: Record<SortKey, string> = {
   ending: "Ending soon",
   newest: "Newly listed",
   price_low: "Price: low to high",
   price_high: "Price: high to low",
-} as const;
-type Sort = keyof typeof SORTS;
-
-const price = (a: Auction) => a.currentHigh ?? a.startingPrice;
-
-// Live auctions closing first, then upcoming by start, then finished (most recent first).
-function endingRank(a: Auction): [number, number] {
-  if (a.phase === "LIVE") return [0, a.endsAt];
-  if (a.phase === "SCHEDULED") return [1, a.startsAt];
-  return [2, -a.endsAt];
-}
-
-function sortAuctions(list: Auction[], sort: Sort): Auction[] {
-  const out = [...list];
-  if (sort === "ending") {
-    out.sort((x, y) => {
-      const [rx, kx] = endingRank(x);
-      const [ry, ky] = endingRank(y);
-      return rx - ry || kx - ky;
-    });
-  }
-  if (sort === "price_low") out.sort((x, y) => price(x) - price(y));
-  if (sort === "price_high") out.sort((x, y) => price(y) - price(x));
-  return out; // "newest" is the API's own order
-}
-
-function matches(a: Auction, q: string): boolean {
-  const hay = [a.title, a.description, CATEGORIES[a.category], a.sellerName ?? ""].join(" ").toLowerCase();
-  return q.toLowerCase().split(/\s+/).filter(Boolean).every((word) => hay.includes(word));
-}
+};
+type Sort = SortKey;
 
 type Params = { category?: string; q?: string; sort?: string };
 
@@ -58,14 +30,16 @@ export default async function Home({ searchParams }: { searchParams: Promise<Par
   const sort: Sort = params.sort && params.sort in SORTS ? (params.sort as Sort) : "ending";
   const q = (params.q ?? "").trim();
 
-  let auctions: Auction[] = [];
+  // Search, sorting and paging all happen on the server.
+  const query: AuctionQuery = { category, sort, q: q || undefined };
+  let page: AuctionPage = { auctions: [], nextCursor: null };
   let error: string | null = null;
   try {
-    auctions = sortAuctions(await listAuctions(category), sort);
+    page = await listAuctions(query);
   } catch (e) {
     error = e instanceof Error ? e.message : "Failed to load auctions";
   }
-  if (q) auctions = auctions.filter((a) => matches(a, q));
+  const auctions = page.auctions;
 
   const href = (change: Params) => {
     const next = { category: category ?? undefined, q: q || undefined, sort: sort === "ending" ? undefined : sort, ...change };
@@ -132,10 +106,13 @@ export default async function Home({ searchParams }: { searchParams: Promise<Par
       {error && <p className="notice bad">{error}</p>}
       {!error && auctions.length === 0 && (
         <div className="empty-state">
-          {q ? <>No auctions match “{q}”. <Link href={href({ q: undefined })}>Clear search</Link></> : "No auctions here yet."}
+          {q ? <>No auctions match “{q}”. <Link href={href({ q: undefined })}>Clear search</Link></>
+            : sort === "newest" ? "No auctions here yet."
+            : <>Nothing live or upcoming here right now. <Link href={href({ sort: "newest" })}>See past auctions</Link></>}
         </div>
       )}
-      <AuctionGrid auctions={auctions} />
+      {/* key: a new search or filter starts a fresh list (and drops pages loaded for the old one) */}
+      <AuctionList key={JSON.stringify(query)} initial={auctions} nextCursor={page.nextCursor} query={query} />
     </div>
   );
 }

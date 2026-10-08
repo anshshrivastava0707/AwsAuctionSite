@@ -17,7 +17,7 @@ import type { ConnStatus } from "./useAuctionSocket";
 
 const MAX_WATCHED = 100; // backend connections.MAX_SUBSCRIPTIONS
 
-export type AlertKind = "OUTBID" | "WON" | "LOST" | "CANCELLED";
+export type AlertKind = "OUTBID" | "WON" | "LOST" | "RESERVE_NOT_MET" | "CANCELLED";
 
 export interface BidAlert {
   id: string;
@@ -45,7 +45,10 @@ const isOver = (a: Auction) => a.status !== "OPEN";
 
 function transition(prev: Auction, next: Auction, userId: string): AlertKind | null {
   if (next.status === "CANCELLED" && prev.status !== "CANCELLED") return "CANCELLED";
-  if (next.status === "CLOSED" && prev.status !== "CLOSED") return next.highBidderId === userId ? "WON" : "LOST";
+  if (next.status === "CLOSED" && prev.status !== "CLOSED") {
+    if (!next.reserveMet) return "RESERVE_NOT_MET";
+    return next.highBidderId === userId ? "WON" : "LOST";
+  }
   if (!isOver(next) && prev.highBidderId === userId && next.highBidderId !== userId) return "OUTBID";
   return null;
 }

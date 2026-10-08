@@ -1,5 +1,6 @@
 import type {
-  Auction, BidHistoryEntry, Category, ListingInput, PrivateUser, PublicUser, Snapshot, UploadTicket,
+  Auction, AuctionPage, BidHistoryEntry, Category, ListingInput, PrivateUser, PublicUser, Snapshot, SortKey,
+  UploadTicket,
 } from "./types";
 
 // Each URL is either absolute (the AWS endpoints) or a same-origin path such as
@@ -28,7 +29,7 @@ export function resolveWsUrl(token?: string | null): string {
 }
 
 /** Image URLs end up in markup the *browser* loads, so they always use the public base. */
-export const imageUrl = (key: string) => `${PUBLIC_API_URL}/images/${key}`;
+export const imageUrl = (key: string, size?: "thumb") => `${PUBLIC_API_URL}/images/${key}${size ? `?size=${size}` : ""}`;
 
 export class ApiError extends Error {
   constructor(public status: number, message: string) {
@@ -68,8 +69,26 @@ const json = (method: string, body?: unknown) => ({
 
 // ---------------------------------------------------------------- public
 
-export const listAuctions = (category?: Category | null) =>
-  request<{ auctions: Auction[] }>(`/auctions${category ? `?category=${category}` : ""}`).then((r) => r.auctions);
+export interface AuctionQuery {
+  category?: Category | null;
+  sort?: SortKey;
+  q?: string;
+  cursor?: string | null;
+  limit?: number;
+}
+
+export function auctionQueryString({ category, sort, q, cursor, limit }: AuctionQuery): string {
+  const params = new URLSearchParams();
+  if (category) params.set("category", category);
+  if (sort) params.set("sort", sort);
+  if (q) params.set("q", q);
+  if (cursor) params.set("cursor", cursor);
+  if (limit) params.set("limit", String(limit));
+  const qs = params.toString();
+  return qs ? `?${qs}` : "";
+}
+
+export const listAuctions = (query: AuctionQuery = {}) => request<AuctionPage>(`/auctions${auctionQueryString(query)}`);
 
 export const getAuction = (id: string) => request<Snapshot>(`/auctions/${encodeURIComponent(id)}`);
 
@@ -92,7 +111,7 @@ export const createAccount = (token: string, input: { displayName: string; reque
 
 export const updateProfile = (
   token: string,
-  input: Partial<{ displayName: string; bio: string; location: string; avatarKey: string | null }>,
+  input: Partial<{ displayName: string; bio: string; location: string; avatarKey: string | null; emailNotifications: boolean }>,
 ) => request<{ user: PrivateUser }>("/me", { token, ...json("PUT", input) }).then((r) => r.user);
 
 export const requestSellerAccess = (token: string) =>
@@ -100,6 +119,12 @@ export const requestSellerAccess = (token: string) =>
 
 export const getMyBids = (token: string) =>
   request<{ entries: BidHistoryEntry[] }>("/me/bids", { token }).then((r) => r.entries);
+
+export const getSaved = (token: string) =>
+  request<{ auctions: Auction[] }>("/me/saved", { token }).then((r) => r.auctions);
+
+export const setSaved = (token: string, auctionId: string, saved: boolean) =>
+  request<{ saved: boolean }>(`/me/saved/${encodeURIComponent(auctionId)}`, { token, method: saved ? "PUT" : "DELETE" });
 
 export const getMyAuctions = (token: string) =>
   request<{ auctions: Auction[] }>("/me/auctions", { token }).then((r) => r.auctions);

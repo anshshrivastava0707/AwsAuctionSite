@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import AuctionForm from "@/components/AuctionForm";
 import RequireAccount from "@/components/RequireAccount";
-import { getAuction, updateAuction } from "@/lib/api";
+import { getMyAuctions, updateAuction } from "@/lib/api";
 import type { Auction, PrivateUser } from "@/lib/types";
 
 export default function EditAuctionPage() {
@@ -19,8 +19,16 @@ function Edit({ id, user, token }: { id: string; user: PrivateUser; token: strin
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    getAuction(id).then((s) => setAuction(s.auction), (e) => setError(e instanceof Error ? e.message : "Failed to load"));
-  }, [id]);
+    // From "my listings" rather than the public view: it includes the (secret) reserve.
+    getMyAuctions(token).then(
+      (list) => {
+        const mine = list.find((a) => a.auctionId === id);
+        if (mine) setAuction(mine);
+        else setError("Only the seller can edit this auction.");
+      },
+      (e) => setError(e instanceof Error ? e.message : "Failed to load"),
+    );
+  }, [id, token]);
 
   if (error) return <p className="notice bad">{error}</p>;
   if (!auction) return <p className="muted">Loading…</p>;

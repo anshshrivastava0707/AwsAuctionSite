@@ -337,3 +337,22 @@ table.data th, table.data td { padding: 8px 6px; border-bottom: 1px solid var(--
 .alert-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 @keyframes flash-row { from { background: var(--bad-bg); } to { background: transparent; } }
 tr.flash td { animation: flash-row 2.5s ease-out; }
+
+/* ---------------------------------------------------------------- bidding extras */
+.segmented { display: grid; grid-template-columns: 1fr 1fr; padding: 3px; gap: 3px; background: var(--bg); border: 1px solid var(--border); border-radius: 10px; }
+.segmented button { padding: 8px 10px; font-size: 0.88rem; background: transparent; color: var(--muted); border-radius: 8px; }
+.segmented button:hover:not(:disabled) { background: transparent; color: var(--text); }
+.segmented button.on, .segmented button.on:hover:not(:disabled) { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / 0.12); }
+button.buy-now { background: transparent; color: var(--accent); border: 1.5px solid var(--accent); }
+button.buy-now:hover:not(:disabled) { background: var(--accent-soft); }
+.auto-tag { margin-left: 8px; font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 6px; border-radius: 4px; color: var(--accent); background: var(--accent-soft); }
+.hint.soft-close { color: var(--warn); font-weight: 600; }
+.buy-now-tag { position: absolute; left: 16px; bottom: 14px; padding: 4px 10px; font-size: 0.8rem; font-weight: 600; border-radius: 8px; background: var(--surface); color: var(--text); box-shadow: 0 2px 8px rgb(0 0 0 / 0.15); }
+.load-more { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-top: 28px; }
+.load-more button { min-width: 180px; }
+
+/* ---------------------------------------------------------------- sign-in */
+.auth-card { max-width: 440px; }
+.auth-links { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 14px; color: var(--muted); }
+button.link { padding: 0; background: none; color: var(--link); font-weight: 500; border-radius: 0; }
+button.link:hover:not(:disabled) { background: none; text-decoration: underline; }

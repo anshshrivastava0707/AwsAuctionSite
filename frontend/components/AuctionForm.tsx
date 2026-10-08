@@ -33,6 +33,8 @@ export default function AuctionForm({
   const [images, setImages] = useState<string[]>(initial?.images ?? []);
   const [start, setStart] = useState(centsToDollarString(initial?.startingPrice ?? 1000));
   const [increment, setIncrement] = useState(centsToDollarString(initial?.minIncrement ?? 100));
+  const [reserve, setReserve] = useState(initial?.reservePrice != null ? centsToDollarString(initial.reservePrice) : "");
+  const [buyNow, setBuyNow] = useState(initial?.buyNowPrice != null ? centsToDollarString(initial.buyNowPrice) : "");
   const [startNow, setStartNow] = useState(initial ? alreadyStarted : true);
   const [startsAt, setStartsAt] = useState(toLocalInput(initial?.startsAt ?? now + 3_600_000));
   const [endsAt, setEndsAt] = useState(toLocalInput(initial?.endsAt ?? now + 86_400_000));
@@ -57,8 +59,19 @@ export default function AuctionForm({
       : unchanged(startsAt, initial?.startsAt) ? initial!.startsAt : fromLocalInput(startsAt);
     const endMs = unchanged(endsAt, initial?.endsAt) ? initial!.endsAt : fromLocalInput(endsAt);
 
+    const optional = (v: string) => (v.trim() === "" ? null : parseDollarsToCents(v));
+    const reservePrice = optional(reserve);
+    const buyNowPrice = optional(buyNow);
+
     if (!title.trim()) return setError("Enter a title.");
     if (startingPrice == null) return setError("Enter a valid starting price.");
+    if (reserve.trim() && reservePrice == null) return setError("Enter a valid reserve price, or leave it empty.");
+    if (buyNow.trim() && buyNowPrice == null) return setError("Enter a valid Buy it now price, or leave it empty.");
+    if (reservePrice != null && reservePrice <= startingPrice) return setError("The reserve must be above the starting price.");
+    if (buyNowPrice != null && buyNowPrice <= startingPrice) return setError("Buy it now must be above the starting price.");
+    if (buyNowPrice != null && reservePrice != null && buyNowPrice < reservePrice) {
+      return setError("Buy it now must be at least the reserve price.");
+    }
     if (minIncrement == null || minIncrement < 1) return setError("The increment must be at least $0.01.");
     if (!Number.isInteger(qty) || qty < 1 || qty > 1000) return setError("Quantity must be a whole number from 1 to 1000.");
     if (startMs == null || endMs == null) return setError("Pick valid start and end times.");
@@ -68,7 +81,7 @@ export default function AuctionForm({
 
     const full: ListingInput = {
       title: title.trim(), description: description.trim(), category, condition, quantity: qty, images,
-      startingPrice, minIncrement, startsAt: startMs, endsAt: endMs,
+      startingPrice, minIncrement, reservePrice, buyNowPrice, startsAt: startMs, endsAt: endMs,
     };
     let payload: Partial<ListingInput> = full;
     if (initial) {
@@ -135,6 +148,20 @@ export default function AuctionForm({
           <input value={increment} onChange={(e) => setIncrement(e.target.value)} inputMode="decimal" required />
         </label>
       </div>
+      <div className="row">
+        <label>
+          Reserve price ($, optional)
+          <input value={reserve} onChange={(e) => setReserve(e.target.value)} inputMode="decimal" placeholder="None" />
+        </label>
+        <label>
+          Buy it now price ($, optional)
+          <input value={buyNow} onChange={(e) => setBuyNow(e.target.value)} inputMode="decimal" placeholder="None" />
+        </label>
+      </div>
+      <p className="hint" style={{ margin: 0 }}>
+        The reserve is the lowest price you&apos;ll accept; it stays secret and bidders only see whether it&apos;s been
+        met. Buy it now lets someone end the auction at that price, until the first bid arrives.
+      </p>
 
       {alreadyStarted ? (
         <p className="small muted" style={{ margin: 0 }}>Started {formatDateTime(initial!.startsAt)}</p>

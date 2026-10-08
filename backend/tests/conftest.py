@@ -23,6 +23,7 @@ os.environ.update({
     "BIDS_TABLE": "bids",
     "CONNECTIONS_TABLE": "connections",
     "USERS_TABLE": "users",
+    "SAVES_TABLE": "saves",
     "IMAGES_BUCKET": "images",
     "AUTH_MODE": "dev",
     "DEV_AUTH_SECRET": "test-secret-0123456789",

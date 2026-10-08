@@ -23,6 +23,10 @@ MAX_START_DELAY_SECONDS = 30 * 24 * 3600
 CLOCK_SKEW_MS = 60_000  # a start time this far in the past still counts as "now"
 MAX_IMAGES = 8
 MAX_QUANTITY = 1000
+# Soft close: a bid this close to the end pushes the end out to now + this.
+EXTEND_WINDOW_MS = 2 * 60 * 1000
+# Constant partition key of the byEnding index; present only while an auction is OPEN.
+OPEN_LISTING = "OPEN"
 
 # Keep in sync with frontend/lib/types.ts.
 CATEGORIES = (
@@ -110,7 +114,7 @@ def _images(value: Any, owner_id: str) -> list[str]:
 # --------------------------------------------------------------------------- auctions
 
 _LISTING_FIELDS = ("title", "description", "category", "condition", "quantity", "images",
-                   "startingPrice", "minIncrement", "startsAt", "endsAt")
+                   "startingPrice", "minIncrement", "reservePrice", "buyNowPrice", "startsAt", "endsAt")
 
 
 def _validate_listing_field(name: str, value: Any, owner_id: str) -> Any:
@@ -130,6 +134,8 @@ def _validate_listing_field(name: str, value: Any, owner_id: str) -> Any:
         return _int(value, "startingPrice", minimum=0, maximum=MAX_AMOUNT_CENTS)
     if name == "minIncrement":
         return _int(value, "minIncrement", minimum=1, maximum=MAX_AMOUNT_CENTS)
+    if name in ("reservePrice", "buyNowPrice"):
+        return None if value is None else _int(value, name, minimum=1, maximum=MAX_AMOUNT_CENTS)
     if name in ("startsAt", "endsAt"):
         return _int(value, name, minimum=0, maximum=2**53)
     raise ValidationError(f"unknown field {name}")
@@ -148,6 +154,16 @@ def _validate_schedule(starts_at: int, ends_at: int, at: int, *, check_start: bo
         raise ValidationError("the auction can run for at most 7 days")
 
 
+def _validate_prices(starting: int, reserve: int | None, buy_now: int | None) -> None:
+    if reserve is not None and reserve <= starting:
+        raise ValidationError("the reserve price must be above the starting price")
+    if buy_now is not None:
+        if buy_now <= starting:
+            raise ValidationError("the Buy it now price must be above the starting price")
+        if reserve is not None and buy_now < reserve:
+            raise ValidationError("the Buy it now price must be at least the reserve price")
+
+
 def parse_create_auction(body: Any, owner_id: str, at_ms: int | None = None) -> dict:
     """Times are either absolute (`startsAt`/`endsAt`) or, for scripts, a
     `durationSeconds` that starts the auction immediately."""
@@ -163,7 +179,10 @@ def parse_create_auction(body: Any, owner_id: str, at_ms: int | None = None) -> 
         "images": _validate_listing_field("images", body.get("images"), owner_id),
         "startingPrice": _validate_listing_field("startingPrice", body.get("startingPrice"), owner_id),
         "minIncrement": _validate_listing_field("minIncrement", body.get("minIncrement", 100), owner_id),
+        "reservePrice": _validate_listing_field("reservePrice", body.get("reservePrice"), owner_id),
+        "buyNowPrice": _validate_listing_field("buyNowPrice", body.get("buyNowPrice"), owner_id),
     }
+    _validate_prices(data["startingPrice"], data["reservePrice"], data["buyNowPrice"])
     if "endsAt" in body:
         starts_at = _validate_listing_field("startsAt", body.get("startsAt", at), owner_id)
         ends_at = _validate_listing_field("endsAt", body["endsAt"], owner_id)
@@ -190,6 +209,9 @@ def parse_auction_update(body: Any, current: dict, owner_id: str, at_ms: int | N
     changes = {k: v for k, v in changes.items() if current.get(k) != v}
     if not changes:
         raise ValidationError("nothing to change")
+    if {"startingPrice", "reservePrice", "buyNowPrice"} & set(changes):
+        merged = {**current, **changes}
+        _validate_prices(merged["startingPrice"], merged.get("reservePrice"), merged.get("buyNowPrice"))
     if "startsAt" in changes or "endsAt" in changes:
         starts_at = changes.get("startsAt", current.get("startsAt", current["createdAt"]))
         ends_at = changes.get("endsAt", current["endsAt"])
@@ -199,14 +221,29 @@ def parse_auction_update(body: Any, current: dict, owner_id: str, at_ms: int | N
 
 def parse_bid(msg: dict) -> dict:
     """The bidder's identity is NOT taken from the message — it comes from the
-    authenticated connection (see handlers/ws.py)."""
+    authenticated connection (see handlers/ws.py).
+
+    `amount` is the bid placed now. `maxAmount` (optional, >= amount) turns on
+    automatic bidding: the system bids for this bidder, one increment at a time,
+    up to that ceiling. `buyNow: true` buys at the listing's Buy it now price,
+    which must equal `amount` (so the price can't change under the buyer)."""
     bid = {
         "auctionId": _id(msg.get("auctionId"), "auctionId"),
-        "bidId": _id(msg.get("bidId"), "bidId"),
+        # Leaves room for the "auto-" prefix of the automatic bids it triggers.
+        "bidId": _str(_id(msg.get("bidId"), "bidId"), "bidId", max_len=58),
         "amount": _int(msg.get("amount"), "amount", minimum=1, maximum=MAX_AMOUNT_CENTS),
     }
     if msg.get("termsVersion") is not None:
         bid["termsVersion"] = _int(msg["termsVersion"], "termsVersion", minimum=1, maximum=2**31)
+    if msg.get("maxAmount") is not None:
+        bid["maxAmount"] = _int(msg["maxAmount"], "maxAmount", minimum=bid["amount"], maximum=MAX_AMOUNT_CENTS)
+    if msg.get("buyNow") is not None:
+        if not isinstance(msg["buyNow"], bool):
+            raise ValidationError("buyNow must be true or false")
+        if msg["buyNow"]:
+            if "maxAmount" in bid:
+                raise ValidationError("buyNow can't be combined with maxAmount")
+            bid["buyNow"] = True
     return bid
 
 
@@ -232,24 +269,40 @@ def new_auction_item(data: dict, seller: dict, created_at_ms: int | None = None)
         "images": data["images"],
         "startingPrice": data["startingPrice"],
         "minIncrement": data["minIncrement"],
+        "reservePrice": data.get("reservePrice"),
+        "buyNowPrice": data.get("buyNowPrice"),
         # minNextBid is denormalised because DynamoDB condition expressions
         # cannot do arithmetic: the bid condition is simply `minNextBid <= :amount`.
         "minNextBid": data["startingPrice"],
         "currentHigh": None,
         "highBidderId": None,
         "highBidderName": None,
+        # The leader's automatic-bidding ceiling. Never sent to clients.
+        "proxyMax": None,
         "bidCount": 0,
+        "watchCount": 0,
         "status": OPEN,
         "version": 1,
         # Bumped by every listing edit; a bid can pin the terms it was placed against.
         "termsVersion": 1,
         # Constant partition key for the byListing index ("all auctions, newest first").
         "listing": "ALL",
+        # Partition key of the byEnding index; removed when the auction closes or is cancelled.
+        "openListing": OPEN_LISTING,
+        "price": data["startingPrice"],
+        "searchText": search_text(data, seller["displayName"]),
         "createdAt": created,
         "updatedAt": created,
         "startsAt": data["startsAt"],
         "endsAt": data["endsAt"],
     }
+
+
+def search_text(data: dict, seller_name: str) -> str:
+    """Lower-cased words a search can match (DynamoDB `contains` is case-sensitive)."""
+    parts = [data.get("title", ""), data.get("description", ""), data.get("category", "").replace("_", " "),
+             seller_name or ""]
+    return " ".join(" ".join(parts).lower().split())[:3000]
 
 
 def _plain(value: Any) -> Any:
@@ -292,6 +345,13 @@ def public_auction(item: dict, at_ms: int | None = None) -> dict:
         "minIncrement": item["minIncrement"],
         "minNextBid": item["minNextBid"],
         "currentHigh": item.get("currentHigh"),
+        # The reserve amount stays secret; bidders only learn whether it is met.
+        "hasReserve": item.get("reservePrice") is not None,
+        "reserveMet": reserve_met(item),
+        # Offered only until the first bid.
+        "buyNowPrice": item.get("buyNowPrice") if p in ("LIVE", "SCHEDULED") and not item.get("bidCount") else None,
+        "soldVia": item.get("soldVia"),
+        "watchCount": max(0, item.get("watchCount") or 0),
         "highBidderId": item.get("highBidderId"),
         "highBidderName": item.get("highBidderName"),
         "bidCount": item.get("bidCount", 0),
@@ -307,6 +367,17 @@ def public_auction(item: dict, at_ms: int | None = None) -> dict:
     }
 
 
+def reserve_met(item: dict) -> bool:
+    reserve = item.get("reservePrice")
+    high = item.get("currentHigh")
+    return high is not None and (reserve is None or int(high) >= int(reserve))
+
+
+def winner_id(item: dict) -> str | None:
+    """Who won an ended auction: the high bidder, provided the reserve was met."""
+    return item.get("highBidderId") if item.get("status") == CLOSED and reserve_met(item) else None
+
+
 def public_bid(item: dict) -> dict:
     item = {k: _plain(v) for k, v in item.items()}
     return {
@@ -316,6 +387,7 @@ def public_bid(item: dict) -> dict:
         "bidderName": item["bidderName"],
         "amount": item["amount"],
         "placedAt": item["placedAt"],
+        "auto": bool(item.get("auto")),
     }
 
 
@@ -333,7 +405,7 @@ def parse_registration(body: Any) -> dict:
 def parse_profile_update(body: Any, owner_id: str) -> dict:
     if not isinstance(body, dict):
         raise ValidationError("body must be a JSON object")
-    allowed = {"displayName", "bio", "location", "avatarKey"}
+    allowed = {"displayName", "bio", "location", "avatarKey", "emailNotifications"}
     unknown = set(body) - allowed
     if unknown:
         raise ValidationError(f"cannot change: {', '.join(sorted(unknown))}")
@@ -346,6 +418,10 @@ def parse_profile_update(body: Any, owner_id: str) -> dict:
         out["location"] = _str(body["location"], "location", max_len=80, required=False)
     if "avatarKey" in body:
         out["avatarKey"] = None if body["avatarKey"] is None else image_key(body["avatarKey"], "avatarKey", owner_id)
+    if "emailNotifications" in body:
+        if not isinstance(body["emailNotifications"], bool):
+            raise ValidationError("emailNotifications must be true or false")
+        out["emailNotifications"] = body["emailNotifications"]
     if not out:
         raise ValidationError("nothing to change")
     return out
@@ -384,5 +460,6 @@ def private_user(item: dict, *, is_admin: bool) -> dict:
         "email": item.get("email", ""),
         "buyerStatus": item.get("buyerStatus", NONE),
         "sellerStatus": item.get("sellerStatus", NONE),
+        "emailNotifications": item.get("emailNotifications", True),
         "isAdmin": is_admin,
     }

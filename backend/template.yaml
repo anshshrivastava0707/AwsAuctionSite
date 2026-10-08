@@ -15,8 +15,9 @@ Parameters:
     Default: dev
     AllowedValues: [dev, cognito, supabase]
     Description: >-
-      Identity source. 'dev' = passwordless test logins (anyone can be anyone; demos only).
-      'cognito' / 'supabase' are not implemented yet (see src/auction/auth.py).
+      Identity source. 'cognito' = the user pool below (real accounts).
+      'dev' = passwordless test logins (anyone can be anyone; local work and demos only).
+      'supabase' is not implemented (see src/auction/auth.py).
   DevAuthSecret:
     Type: String
     NoEcho: true
@@ -26,6 +27,16 @@ Parameters:
     Type: String
     Default: ""
     Description: Comma-separated emails that are admins (approve buyers/sellers)
+  NotifyFrom:
+    Type: String
+    Default: ""
+    Description: >-
+      SES-verified sender for notification emails, e.g. "BidBloom <alerts@example.com>".
+      Empty = emails are only logged.
+  SiteUrl:
+    Type: String
+    Default: ""
+    Description: Public site URL, used for links in emails (e.g. https://main.xxxx.amplifyapp.com)
 
 Globals:
   Function:
@@ -40,7 +51,10 @@ Globals:
         BIDS_TABLE: !Ref BidsTable
         CONNECTIONS_TABLE: !Ref ConnectionsTable
         USERS_TABLE: !Ref UsersTable
+        SAVES_TABLE: !Ref SavesTable
         AUTH_MODE: !Ref AuthMode
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
         DEV_AUTH_SECRET: !Ref DevAuthSecret
         ADMIN_EMAILS: !Ref AdminEmails
 
@@ -56,6 +70,8 @@ Resources:
         - { AttributeName: category, AttributeType: S }
         - { AttributeName: sellerId, AttributeType: S }
         - { AttributeName: createdAt, AttributeType: N }
+        - { AttributeName: openListing, AttributeType: S }
+        - { AttributeName: endsAt, AttributeType: N }
       KeySchema:
         - { AttributeName: auctionId, KeyType: HASH }
       GlobalSecondaryIndexes:
@@ -73,6 +89,12 @@ Resources:
           KeySchema:
             - { AttributeName: sellerId, KeyType: HASH }
             - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        # Open auctions only (openListing is removed on close/cancel), soonest end first.
+        - IndexName: byEnding
+          KeySchema:
+            - { AttributeName: openListing, KeyType: HASH }
+            - { AttributeName: endsAt, KeyType: RANGE }
           Projection: { ProjectionType: ALL }
       StreamSpecification:
         StreamViewType: NEW_AND_OLD_IMAGES
@@ -139,6 +161,63 @@ Resources:
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
 
+  # Saved ("watched") auctions; the auction row keeps a denormalised watchCount.
+  SavesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: auctionId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: auctionId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byAuction
+          KeySchema:
+            - { AttributeName: auctionId, KeyType: HASH }
+            - { AttributeName: userId, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ------------------------------------------------------------------ Accounts (AUTH_MODE=cognito)
+  # The browser calls Cognito directly for sign-up, sign-in and password resets
+  # (USER_PASSWORD_AUTH over TLS); the backend only verifies the resulting ID token.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: false
+          RequireSymbols: false
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailSubject: Your BidBloom verification code
+        EmailMessage: "Your BidBloom verification code is {####}"
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { IdToken: minutes, AccessToken: minutes, RefreshToken: days }
+
   # ------------------------------------------------------------------ Images (private; served via signed URLs)
   ImagesBucket:
     Type: AWS::S3::Bucket
@@ -157,6 +236,11 @@ Resources:
             AllowedMethods: [POST]
             AllowedHeaders: ["*"]
             MaxAge: 3000
+      # Uploads reach the thumbnail function through EventBridge (no bucket -> function
+      # reference, which would be a dependency cycle with the function's policy).
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
 
   # ------------------------------------------------------------------ WebSocket API
   WebSocketApi:
@@ -292,16 +376,20 @@ Resources:
         Variables:
           SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
           CLOSE_FUNCTION_ARN: !GetAtt CloseAuctionFunction.Arn
+          NOTIFY_FUNCTION_ARN: !GetAtt NotifyFunction.Arn
           IMAGES_BUCKET: !Ref ImagesBucket
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref AuctionsTable }
         - DynamoDBReadPolicy: { TableName: !Ref BidsTable }
         - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref SavesTable }
         - S3CrudPolicy: { BucketName: !Ref ImagesBucket }
         - Statement:
             - Effect: Allow
               Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule, scheduler:DeleteSchedule]
-              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/close-*"
+              Resource:
+                - !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/close-*"
+                - !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/remind-*"
             - Effect: Allow
               Action: iam:PassRole
               Resource: !GetAtt SchedulerInvokeRole.Arn
@@ -316,8 +404,71 @@ Resources:
     Properties:
       Handler: handlers.scheduler.handler
       Timeout: 90
+      Environment:
+        Variables:
+          # To re-schedule itself when last-minute bids extend an auction.
+          SCHEDULER_ROLE_ARN: !GetAtt SchedulerInvokeRole.Arn
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref AuctionsTable }
+        - Statement:
+            - Effect: Allow
+              Action: [scheduler:CreateSchedule, scheduler:UpdateSchedule]
+              Resource: !Sub "arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/default/close-*"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt SchedulerInvokeRole.Arn
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handlers.notify.handler
+      Timeout: 120
+      Environment:
+        Variables:
+          NOTIFY_FROM: !Ref NotifyFrom
+          SITE_URL: !Ref SiteUrl
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref AuctionsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref BidsTable }
+        - DynamoDBReadPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBReadPolicy: { TableName: !Ref SavesTable }
+        - Statement:
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: "*"
+      Events:
+        AuctionChanges:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt AuctionsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 25
+            MaximumBatchingWindowInSeconds: 1
+            MaximumRetryAttempts: 2
+            BisectBatchOnFunctionError: true
+
+  ThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: thumbs/
+      Handler: app.handler
+      Timeout: 30
+      MemorySize: 1024
+      Environment:
+        Variables:
+          IMAGES_BUCKET: !Ref ImagesBucket
+      Policies:
+        - S3CrudPolicy: { BucketName: !Ref ImagesBucket }
+      Events:
+        Uploaded:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.s3]
+              detail-type: [Object Created]
+              detail:
+                bucket: { name: [!Ref ImagesBucket] }
+                object: { key: [{ prefix: uploads/ }] }
 
   SchedulerInvokeRole:
     Type: AWS::IAM::Role
@@ -331,13 +482,15 @@ Resources:
             Condition:
               StringEquals: { "aws:SourceAccount": !Ref AWS::AccountId }
       Policies:
-        - PolicyName: invoke-close-function
+        - PolicyName: invoke-scheduled-functions
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # By name pattern rather than !GetAtt: the close function passes this role
+              # when it re-schedules itself, and a direct reference would be a cycle.
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: !GetAtt CloseAuctionFunction.Arn
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-*"
 
   HttpApi:
     Type: AWS::Serverless::HttpApi
@@ -355,3 +508,9 @@ Outputs:
   HttpApiUrl:
     Description: Set as NEXT_PUBLIC_API_URL in the frontend
     Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Description: Set as NEXT_PUBLIC_COGNITO_USER_POOL_ID in the frontend
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Set as NEXT_PUBLIC_COGNITO_CLIENT_ID in the frontend
+    Value: !Ref UserPoolClient

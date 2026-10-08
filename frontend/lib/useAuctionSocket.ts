@@ -46,11 +46,20 @@ type Action =
 
 const MAX_BIDS_SHOWN = 25;
 
+// With automatic bidding two bids can share an amount (a tie goes to the earlier
+// bidder), so bids are keyed by id; only the legacy single `bid` broadcast lacks one.
+const bidKey = (b: Bid) => b.bidId ?? `${b.amount}:${b.bidderId}`;
+
 function mergeBids(current: Bid[], incoming: Bid[]): Bid[] {
-  // Accepted bids have strictly increasing, therefore unique, amounts.
-  const byAmount = new Map(current.map((b) => [b.amount, b]));
-  for (const b of incoming) byAmount.set(b.amount, { ...byAmount.get(b.amount), ...b });
-  return [...byAmount.values()].sort((a, b) => b.amount - a.amount).slice(0, MAX_BIDS_SHOWN);
+  const byKey = new Map(current.map((b) => [bidKey(b), b]));
+  for (const b of incoming) {
+    // A legacy broadcast duplicates a bid we may already hold under its id.
+    if (!b.bidId && current.some((c) => c.amount === b.amount && c.bidderId === b.bidderId)) continue;
+    byKey.set(bidKey(b), { ...byKey.get(bidKey(b)), ...b });
+  }
+  return [...byKey.values()]
+    .sort((a, b) => b.amount - a.amount || b.placedAt - a.placedAt)
+    .slice(0, MAX_BIDS_SHOWN);
 }
 
 function reducer(state: State, action: Action): State {
@@ -73,7 +82,7 @@ function reducer(state: State, action: Action): State {
           return {
             ...state,
             auction: msg.auction,
-            bids: msg.bid ? mergeBids(state.bids, [msg.bid]) : state.bids,
+            bids: msg.bids ? mergeBids(state.bids, msg.bids) : msg.bid ? mergeBids(state.bids, [msg.bid]) : state.bids,
           };
         case "bidResult": {
           const newer = msg.auction && msg.auction.version > state.auction.version;
@@ -188,13 +197,15 @@ export function useAuctionSocket(initial: Snapshot, token: string | null, userId
   }, [auctionId, send, syncPending, storeKey, token, ready]);
 
   const placeBid = useCallback(
-    (amount: number) => {
+    (amount: number, opts: { maxAmount?: number; buyNow?: boolean } = {}) => {
       const msg: PlaceBidMessage = {
         action: "placeBid",
         auctionId,
         bidId: uuid(),
         amount,
         termsVersion: termsRef.current,
+        ...(opts.maxAmount ? { maxAmount: opts.maxAmount } : {}),
+        ...(opts.buyNow ? { buyNow: true } : {}),
       };
       pendingRef.current.set(msg.bidId, msg);
       syncPending();

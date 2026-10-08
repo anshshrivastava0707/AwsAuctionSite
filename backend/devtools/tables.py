@@ -25,12 +25,14 @@ def definitions(prefix: str = "") -> dict[str, dict]:
     return {
         "AuctionsTable": {
             "TableName": f"{prefix}auctions",
-            "AttributeDefinitions": _attrs(auctionId="S", listing="S", category="S", sellerId="S", createdAt="N"),
+            "AttributeDefinitions": _attrs(auctionId="S", listing="S", category="S", sellerId="S", createdAt="N",
+                                           openListing="S", endsAt="N"),
             "KeySchema": _keys("auctionId"),
             "GlobalSecondaryIndexes": [
                 _index("byListing", "listing", "createdAt"),
                 _index("byCategory", "category", "createdAt"),
                 _index("bySeller", "sellerId", "createdAt"),
+                _index("byEnding", "openListing", "endsAt"),
             ],
         },
         "BidsTable": {
@@ -51,6 +53,12 @@ def definitions(prefix: str = "") -> dict[str, dict]:
             "AttributeDefinitions": _attrs(userId="S"),
             "KeySchema": _keys("userId"),
         },
+        "SavesTable": {
+            "TableName": f"{prefix}saves",
+            "AttributeDefinitions": _attrs(userId="S", auctionId="S"),
+            "KeySchema": _keys("userId", "auctionId"),
+            "GlobalSecondaryIndexes": [_index("byAuction", "auctionId", "userId", projection="KEYS_ONLY")],
+        },
     }
 
 
@@ -59,6 +67,7 @@ ENV_VARS = {
     "BidsTable": "BIDS_TABLE",
     "ConnectionsTable": "CONNECTIONS_TABLE",
     "UsersTable": "USERS_TABLE",
+    "SavesTable": "SAVES_TABLE",
 }
 
 

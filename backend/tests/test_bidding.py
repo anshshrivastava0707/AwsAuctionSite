@@ -140,7 +140,7 @@ def test_seller_can_edit_before_first_bid(auction, seller):
                                              {"title": "Better title", "startingPrice": 5000})
     assert new["title"] == "Better title" and int(new["minNextBid"]) == 5000
     assert int(new["termsVersion"]) == 2 and int(new["version"]) == 2
-    assert set(changes) == {"title", "startingPrice", "minNextBid"}
+    assert set(changes) == {"title", "startingPrice", "minNextBid", "price", "searchText"}
 
 
 def test_edit_rejected_after_first_bid_and_for_non_seller(auction, seller, people):

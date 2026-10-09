@@ -1,61 +1,199 @@
-# Real-time auction — AWS serverless backend + Next.js frontend
+# BidBloom: a real-time auction site on AWS
+
+BidBloom is an online auction site where bids show up on every open page as soon as they're placed.
+People list items, others bid on them live, and when the clock runs out the highest bidder wins and
+both sides get an email. The backend is fully serverless on AWS (Lambda, API Gateway, DynamoDB,
+S3, EventBridge, SES, Cognito), and the frontend is a Next.js app hosted on AWS Amplify.
 
 ```
 awsproject/
-├── backend/    Python 3.12 Lambdas, SAM template, tests, local server, load-test script
-└── frontend/   Next.js 15 (App Router, TypeScript)
+├── backend/    Python 3.12 Lambdas, SAM template (backend/template.yaml), tests, local server, scripts
+├── frontend/   Next.js 15 (App Router, TypeScript)
+└── amplify.yml Amplify Hosting build spec for the frontend
 ```
 
-Features: real accounts (Amazon Cognito: sign-up, email verification, password reset) with
-admin-approved buyer and seller roles, profiles with pictures, auction listings with photos,
-category, condition, quantity (sold as one lot to a single winner), start/end times, an optional
-secret reserve price and an optional Buy it now price, edit or cancel before the first bid, live
-bidding with automatic (proxy) bidding up to a private maximum, soft close (a bid in the last 2
-minutes extends the auction), saved auctions with watcher counts, email notifications (outbid,
-won/sold, ending soon), server-side search, sorting and paging, image thumbnails, bidding
-history, and "items I'm selling". Logged-out visitors can browse and watch auctions live, but
-can't bid.
+---
 
-## Architecture
+## How the website works
+
+### 1. Browsing (no account needed)
+
+The home page lists live and upcoming auctions, plus any that ended in the last 15 minutes. You can
+filter by category, search by keyword and sort by **Newly listed**, **Ending soon** or price. Prices
+and countdowns on the cards update live, with no refresh.
+
+Opening an auction shows its photo gallery, description, condition, quantity, seller and full bid
+history. The page holds a live connection to the server, so new bids, price changes and deadline
+extensions appear as they happen. Logged-out visitors can watch everything but can't bid.
+
+### 2. Signing up and getting approved
+
+1. **Create a login.** Sign up with an email and password. Cognito emails you a verification code,
+   and password reset works the same way.
+2. **Create an account.** On first login, onboarding asks for a display name and whether you also
+   want to sell. Every account requests the **buyer** role, and ticking the box requests the
+   **seller** role too. You can add a profile picture or request seller access later from
+   **Account**.
+3. **Wait for approval.** An admin reviews requests at `/admin`. You need an approved buyer role to
+   bid and an approved seller role to list items. Logging in alone doesn't let you do either.
+
+### 3. Selling an item
+
+From **Sell**, an approved seller creates a listing with:
+
+- a title, description, category, condition and up to 8 photos;
+- a **quantity**: several identical items are sold as one lot to a single winner;
+- a **starting price** and a **minimum bid increment**;
+- a **start time** (now, or up to 30 days ahead) and a **duration** (up to 7 days);
+- an optional secret **reserve price**: if bidding ends below it, the item doesn't sell;
+- an optional **Buy it now** price that ends the auction immediately.
+
+Photos upload straight from the browser to S3, and a background function makes small WebP
+thumbnails for the cards. Until the first bid arrives, the seller can **edit** or **cancel** the
+listing. After that it's locked, so no bidder ever bids on terms that later change.
+
+**Selling** (`/me/selling`) lists everything you've put up and how each listing is doing.
+
+### 4. Bidding
+
+On a live auction an approved buyer has three ways to bid:
+
+- **Place a bid** at or above the minimum next bid shown on the page.
+- **Automatic bidding.** Enter the most you're willing to pay. The site bids for you, one increment
+  at a time, only as high as needed to keep you in the lead. Your maximum stays private. If two
+  people set automatic bids, the higher maximum wins at one increment above the other's, and when
+  the maximums are equal, whoever bid first keeps the lead.
+- **Buy it now**, if the seller set a price and nobody has bid yet. This ends the auction at once
+  and you win.
+
+Every bid gets an immediate answer: accepted (with whether you're leading), or rejected with a
+reason such as "too low", "auction has ended" or "listing changed". Sellers can't bid on their own
+items.
+
+**Soft close.** A bid placed in the last 2 minutes pushes the end time to 2 minutes from that bid.
+Last-second sniping doesn't work: everyone always gets a chance to respond.
+
+**My bids** (`/me/bids`) shows every auction you've bid on and whether you're winning. The heart
+icon **saves** an auction to `/me/saved`, and listings show how many people have saved them.
+
+### 5. When an auction ends
+
+At the end time a scheduled job closes the auction, and every open page sees it switch to *Ended*.
+Then:
+
+| Outcome | Who gets an email |
+|---|---|
+| Sold (highest bid met the reserve, or Buy it now) | One sale confirmation to the buyer, with the seller in CC, so both have the same record: a reference number, item, price and each other's email |
+| Bids, but the reserve wasn't met | Seller: the item didn't sell and nobody pays anything |
+| No bids | Seller: a nudge to relist it |
+
+Bidders also get emails along the way: **outbid** when someone takes the lead from them, and
+**ending soon** an hour before the end of any auction they've bid on or saved. The site doesn't take
+payment. The emails connect buyer and seller, who arrange payment and delivery between themselves.
+
+### 6. Profiles and admin
+
+Every user has a public profile at `/users/{id}` with their picture and listings. Admins (emails
+listed in the stack's `AdminEmails`) get an **Admin** page where they approve or reject buyer and
+seller requests and can take down a listing that breaks the rules. The seller and the leading
+bidder are emailed when a listing is taken down.
+
+---
+
+## How it works under the hood
+
+### Architecture
 
 ```
-Browser ──wss──► API Gateway WebSocket API ──► WebSocketFunction ($connect/$disconnect/subscribe/placeBid/ping)
-   │                                                 │
-   └──https──► API Gateway HTTP API ──► HttpFunction  │  (ANY /{proxy+}: routing in handlers/http.py)
-                                          │  │        ▼
-                                          │  │   DynamoDB: Auctions (stream) · Bids · Connections · Users · Saves
-                                          │  └─► S3 (images, private; signed upload/download URLs)
-                                          │       │ EventBridge "Object Created" ─► ThumbnailFunction (WebP thumbs)
-                                          │       │
-                         EventBridge Scheduler    └─ Auctions stream ─┬─► BroadcastFunction ─► postToConnection (all subscribers)
-                         close-<id> at endsAt ─► CloseAuctionFunction └─► NotifyFunction ─► SES (outbid / won / sold)
-                         remind-<id> 1h before ─► NotifyFunction ─► SES (ending soon)
+                         ┌──────────── Cognito user pool (sign-up / sign-in / reset)
+                         │
+Browser (Next.js on Amplify)
+   │
+   ├─https─► API Gateway HTTP API ─► HttpFunction ──────────┬─► DynamoDB
+   │          (pages, listings, accounts, uploads, admin)   │     Auctions (with stream) · Bids
+   │                                                        │     Connections · Users · Saves
+   │                                                        └─► S3 images (private, signed URLs)
+   │                                                               │ "Object Created"
+   │                                                               └─► ThumbnailFunction (WebP thumbs)
+   │
+   └─wss──► API Gateway WebSocket API ─► WebSocketFunction
+              (subscribe · watch · placeBid · ping)     │ bids are committed to DynamoDB
+                                                        ▼
+                                   Auctions table stream ─┬─► BroadcastFunction ─► push to every subscriber
+                                                          └─► NotifyFunction ─────► SES (outbid / sale / no sale)
 
-Browser ──https──► Cognito user pool (sign-up / sign-in / reset); the backend verifies the ID token.
+EventBridge Scheduler  ── at endsAt ─────► CloseAuctionFunction (closes the auction; the stream does the rest)
+                       ── 1 h before end ─► NotifyFunction ─► SES (ending soon)
 ```
 
-## How each requirement is met
+| Piece | Role |
+|---|---|
+| **Amplify Hosting** | Builds and serves the Next.js app (server-rendered pages). Rebuilds on every push to `main`. |
+| **HTTP API → `HttpFunction`** | All request/response calls: listings, search, accounts, saves, uploads, admin. Routing lives in `backend/src/handlers/http.py`. |
+| **WebSocket API → `WebSocketFunction`** | Live connections. Clients subscribe to one auction (detail page) or watch up to 100 (card grids), and place bids over the socket. |
+| **DynamoDB** | The only source of truth. Lambdas keep no state between calls. |
+| **DynamoDB Stream** | Every committed change to an auction triggers the broadcaster and the email sender. |
+| **EventBridge Scheduler** | One-off schedules per auction: close it at `endsAt`, send the ending-soon email an hour before. |
+| **S3 + `ThumbnailFunction`** | Private image storage with signed upload and download URLs, plus automatic thumbnails. |
+| **SES** | Outgoing email. |
+| **Cognito** | Logins. The browser talks to Cognito directly, and the backend verifies the ID token on every call. |
 
-| Requirement | Mechanism | Code |
+### The life of a bid
+
+1. The browser sends `placeBid` over the WebSocket with a client-generated `bidId`, the amount and
+   the version of the listing terms it's bidding on.
+2. `WebSocketFunction` reads the auction and works out the result in `plan_bid`, a pure function:
+   automatic counter-bids, reserve, soft-close extension, Buy it now.
+3. It commits that result in **one DynamoDB transaction**, conditioned on the auction's `version`
+   being unchanged, the auction being open, the bidder being an approved buyer and not the seller,
+   and the `bidId` not existing yet. If anything changed in between, the transaction fails, and the
+   bid is re-planned against the fresh state.
+4. The bidder gets a `bidResult` reply.
+5. The committed change appears on the Auctions table's stream. `BroadcastFunction` pushes the new
+   state to every connection watching that auction, and `NotifyFunction` emails the previous leader
+   if they were outbid.
+
+Clients only ever see committed state, and every message carries a rising `version` number, so a
+browser drops stale or duplicate updates and re-syncs if it notices a gap.
+
+### The life of an auction
+
+```
+SCHEDULED ──(startsAt passes)──► LIVE ──(endsAt passes; scheduler closes it)──► ENDED
+     │                            │  (soft close may push endsAt later)           │
+     └── seller cancels ──► CANCELLED (only possible before the first bid)        └─► emails sent
+```
+
+Only `OPEN`, `CLOSED` and `CANCELLED` are stored. *Scheduled*, *live* and *ended* are worked out
+from the clock, so no job is needed to start an auction. When the close job runs and finds the end
+time has moved because of a soft-close extension, it reschedules itself.
+
+### Why it stays correct under pressure
+
+| Concern | How it's handled | Code |
 |---|---|---|
-| **Live push** | API Gateway WebSocket. Every committed change to an auction flows through the DynamoDB Stream to `BroadcastFunction`, which pushes it to all subscribers. Clients are only told about **committed** state. | `handlers/stream.py`, `auction/connections.py` |
-| **Race-safe bids** | A bid is read → plan → one `TransactWriteItems`. `plan_bid` (a pure function) works out the outcome — automatic bids, reserve, soft-close extension, Buy it now — and the transaction commits it conditioned on `version = <the version planned from> AND status = OPEN AND startsAt <= now < endsAt`, together with the bid rows (`attribute_not_exists(bidId)`). `version` moves on every bid, edit and close, so read and write form one atomic compare-and-set: if anything changed in between, the write fails and the bid is re-planned against the state DynamoDB returns with the failure. A stale or lower bid is re-planned into a rejection. `TransactionConflict` cancellations are retried with backoff. Ties: the earlier bidder keeps the lead. | `auction/repository.py::place_bid`, `plan_bid` |
-| **Automatic bidding** | The leader's maximum lives on the auction row as `proxyMax`, never sent to clients. A challenger with a higher maximum takes the lead one increment above the old maximum; otherwise the leader's automatic bid answers one increment above the challenger. The outcome doesn't depend on bidding order. | `plan_bid` |
-| **Soft close** | A bid with less than 2 minutes left moves `endsAt` to now + 2 minutes, in the same transaction. The close job re-schedules itself when it finds the end has moved. | `plan_bid`, `handlers/scheduler.py` |
-| **Persisted state** | DynamoDB is the only source of truth; Lambdas are stateless. A fresh page load (Next.js server render → `GET /auctions/{id}`) and a WebSocket `subscribe` both do a **strongly consistent** read. | `repository.snapshot` |
-| **Identity & approval** | The backend never trusts a user id sent by the client. HTTP calls carry `Authorization: Bearer <token>`, and the WebSocket gets the token as `?token=` at `$connect`, which binds the identity to the connection. Bids use that identity. Buyer approval is a `ConditionCheck` **inside** the bid transaction, so revoking it takes effect atomically. The token source is pluggable (`auction/auth.py`). | `auction/auth.py`, `auction/users.py` |
-| **Seller rules** | Sellers can't bid on their own auctions (`sellerId <> bidder` in the bid condition). Edit and cancel are conditional on `bidCount = 0`, so an edit and a first bid can never both succeed. Each bid also carries the `termsVersion` it was placed against, and an edit in between rejects it with `TERMS_CHANGED`. | `repository.update_auction`, `cancel_auction` |
-| **Disconnect / reconnect safety** | `$disconnect` deletes only a routing row and never touches auction data. Dead connections are pruned on 410 Gone and by TTL. Bids are idempotent by client-generated `bidId`: a client that drops mid-bid reconnects and re-sends the same bid, and is told "already accepted" instead of bidding twice. Subscribe registers **before** reading the snapshot, so no update falls in between. Every message carries a monotonically increasing `version`: clients drop old or duplicate updates and re-sync on a gap. A heartbeat `ping` returns the current version as a backstop check. | `handlers/ws.py`, `frontend/lib/useAuctionSocket.ts` |
+| **Two bids at the same moment** | Read, plan, then one `TransactWriteItems` conditioned on the version that was read: an atomic compare-and-set. The loser of a race is re-planned, never applied on stale data. Contention retries back off. | `auction/repository.py::place_bid`, `plan_bid` |
+| **Automatic bidding fairness** | The leader's maximum (`proxyMax`) lives on the auction row and is never sent to clients. The outcome doesn't depend on the order bids arrive in. | `plan_bid` |
+| **Seller edits during bidding** | Edit and cancel require `bidCount = 0`. Every bid carries the `termsVersion` it saw, and is rejected with `TERMS_CHANGED` if the listing changed in between. | `repository.update_auction`, `cancel_auction` |
+| **Who is bidding** | The server never trusts a user id from the client. HTTP calls carry `Authorization: Bearer <token>`, and the WebSocket passes it as `?token=` at connect time, which binds the user to the connection. Buyer approval is checked **inside** the bid transaction, so revoking it takes effect at once. | `auction/auth.py`, `auction/users.py` |
+| **Dropped connections** | Bids are idempotent by `bidId`. A client that disconnects mid-bid reconnects, re-sends the same bid and is told "already accepted" instead of bidding twice. Disconnecting only removes a routing row. Dead connections are pruned on `410 Gone` and by TTL. | `handlers/ws.py`, `frontend/lib/useAuctionSocket.ts` |
+| **Missed updates** | `subscribe` registers the connection **before** reading the snapshot, so no update can slip in between. A heartbeat `ping` returns the current version as a backstop. | `handlers/ws.py` |
+| **Fresh page loads** | The server-rendered auction page and the WebSocket snapshot both use **strongly consistent** reads. | `repository.snapshot` |
 
-## WebSocket protocol
+---
 
-Connect to `<WebSocketUrl>?token=<login token>` to bid. Without a token, the connection can only watch.
-The bidder is always the connection's user; any `bidderId` in a message is ignored.
+## Reference
+
+### WebSocket protocol
+
+Connect to `<WebSocketUrl>?token=<login token>` to bid. Without a token the connection can only
+watch. The bidder is always the connection's user, and any `bidderId` in a message is ignored.
 
 Client → server (`action` selects the API Gateway route):
 
 ```json
 {"action":"subscribe","auctionId":"…"}
+{"action":"watch","auctionIds":["…","…"]}
 {"action":"placeBid","auctionId":"…","bidId":"<uuid>","amount":1500,"termsVersion":1}
 {"action":"placeBid","auctionId":"…","bidId":"<uuid>","amount":1500,"maxAmount":5000,"termsVersion":1}   automatic bidding
 {"action":"placeBid","auctionId":"…","bidId":"<uuid>","amount":9000,"buyNow":true,"termsVersion":1}      Buy it now (amount = the price)
@@ -66,105 +204,136 @@ Server → client:
 
 ```json
 {"type":"snapshot","auction":{…},"bids":[…]}
+{"type":"watching","auctions":[…]}
 {"type":"auctionUpdate","auction":{…},"bid":{…}?,"bids":[…]?}        bids = every row the commit wrote, automatic bids included
 {"type":"bidResult","bidId":"…","status":"ACCEPTED|REJECTED","reason":"BID_TOO_LOW|AUCTION_CLOSED|NOT_STARTED|OWN_AUCTION|TERMS_CHANGED|NOT_APPROVED|NOT_AUTHENTICATED|NOT_FOUND|DUPLICATE_ID|BUSY|ALREADY_LEADING|BUY_NOW_UNAVAILABLE|null","message":"…","duplicate":false,"auction":{…},"leading":true?,"yourMax":5000?,"extendedTo":1760000000000?}
 {"type":"pong","auctionId":"…","version":7}
 {"type":"error","message":"…"}
 ```
 
-All money values are **integer cents**; all times are epoch milliseconds.
+All money values are **integer cents**, and all times are epoch milliseconds.
 
-## Accounts and login
+### HTTP API
 
-`AUTH_MODE` (a template parameter) selects where identities come from:
+| Access | Endpoints |
+|---|---|
+| Public | `GET /auctions?category=&sort=newest\|ending\|price_low\|price_high&q=&cursor=&limit=` (a page plus `nextCursor`), `GET /auctions/{id}`, `GET /users/{id}`, `GET /users/{id}/auctions`, `GET /images/{key}?size=thumb` |
+| Logged in | `GET\|POST\|PUT /me`, `POST /me/seller-request`, `GET /me/bids`, `GET /me/auctions`, `GET /me/saved`, `PUT\|DELETE /me/saved/{id}`, `POST /uploads`, `POST /auctions`, `PATCH /auctions/{id}`, `POST /auctions/{id}/cancel` |
+| Admin | `GET /admin/users?filter=pending\|all`, `POST /admin/users/{id}`, `POST /admin/auctions/{id}/remove {reason}` |
 
-- **`cognito`**: the stack's user pool. The browser calls Cognito directly for sign-up (with an emailed
-  code), sign-in and password reset (`frontend/lib/cognito.ts`); the backend verifies the ID token's RS256
-  signature against the pool's JWKS plus `iss`/`aud`/`token_use`/`exp`, and requires a verified email
-  (`backend/src/auction/auth.py`). ID tokens last an hour and are refreshed in the background.
-  Frontend env: `NEXT_PUBLIC_COGNITO_USER_POOL_ID` and `NEXT_PUBLIC_COGNITO_CLIENT_ID` (stack outputs).
-- **`dev`**: `POST /auth/dev-login {email}` returns an HMAC-signed token. There are no passwords, so anyone
-  can sign in as any email. Use it only for local work and demos. The frontend uses it when no Cognito
-  client id is set.
+See `backend/src/handlers/http.py`.
 
-Approval is separate from login. After first login a user creates an account (`POST /me`), and an admin
-(an email in `AdminEmails`) approves each role at `/admin`. Buyer status `APPROVED` is needed to bid; seller
-status `APPROVED` is needed to list. Admins are approved for both roles automatically.
+### Login modes
 
-### Demo admin account for judges
+The `AuthMode` template parameter selects where identities come from:
 
-`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) an approved admin
-account with a known password, `judge.admin@bidbloom.demo` / `Judge-admin-2026`. Its address can't receive
-mail and is never emailed. Add it to the stack's `AdminEmails` for it to have admin rights.
+- **`cognito`** (use this for anything real): the stack's user pool. The browser handles sign-up,
+  sign-in and reset against Cognito (`frontend/lib/cognito.ts`). The backend verifies the ID
+  token's RS256 signature against the pool's JWKS, plus `iss`, `aud`, `token_use` and `exp`, and
+  requires a verified email (`backend/src/auction/auth.py`). Tokens last an hour and refresh in the
+  background.
+- **`dev`**: `POST /auth/dev-login {email}` returns an HMAC-signed token. There are no passwords,
+  so anyone can sign in as any email. It's for local work only. The frontend uses it when no Cognito
+  client id is configured.
 
-## HTTP API
+### Demo admin account
 
-Public: `GET /auctions?category=&sort=newest|ending|price_low|price_high&q=&cursor=&limit=` (a page plus
-`nextCursor`), `GET /auctions/{id}`, `GET /users/{id}`, `GET /users/{id}/auctions`, `GET /images/{key}?size=thumb`.
-Logged in: `GET|POST|PUT /me`, `POST /me/seller-request`, `GET /me/bids`, `GET /me/auctions`,
-`GET /me/saved`, `PUT|DELETE /me/saved/{id}`, `POST /uploads`, `POST /auctions`, `PATCH /auctions/{id}`,
-`POST /auctions/{id}/cancel`.
-Admin: `GET /admin/users?filter=pending|all`, `POST /admin/users/{id}`, `POST /admin/auctions/{id}/remove {reason}`
-(take down a listing that breaks the terms, in any state but cancelled; the seller and leading bidder are emailed). See `backend/src/handlers/http.py`.
+`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) an approved
+admin account, `judge.admin@bidbloom.demo` / `Judge-admin-2026`. The address can't receive mail
+and is never emailed. Add it to the stack's `AdminEmails` to give it admin rights.
 
-## Backend
+---
 
-Prerequisites: an AWS account with credentials configured (`aws configure` or SSO), the
-[AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html), and the
+## Running it yourself
+
+### Backend
+
+Prerequisites: an AWS account with credentials configured, the
+[AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) and the
 [SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html).
 
 ```bash
 cd backend
-source .venv/bin/activate          # already created; deps from requirements-dev.txt
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+
 pytest                             # unit + handler tests (moto, offline), incl. a 40-thread bid race x5
 cfn-lint template.yaml             # template lint
 
 sam build
-sam deploy --guided                # first time; set AuthMode=cognito, AdminEmails, SiteUrl, NotifyFrom; prints the URLs
-sam sync --watch                   # fast iteration on Lambda code against the dev stack
+sam deploy --guided                # first time; prints the API URLs and Cognito ids
+sam sync --watch                   # fast iteration on Lambda code against a dev stack
 ```
 
-Prove concurrency against the real deployment:
+Main deploy parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `AuthMode` | `cognito` or `dev` (see above) |
+| `AdminEmails` | Comma-separated emails that get admin rights |
+| `AllowedOrigin` | The frontend's URL, for CORS |
+| `SiteUrl` | The frontend's URL, used for links in emails |
+| `NotifyFrom` | SES-verified sender, e.g. `BidBloom <alerts@example.com>`. If empty, emails are logged instead of sent |
+| `DevAuthSecret` | Signing secret for `dev` mode. Keep it the same across deploys, or existing logins break |
+
+Test bidding under real concurrency against a deployed stack:
 
 ```bash
 python scripts/concurrency_test.py --api <HttpApiUrl> --ws <WebSocketUrl> --admin-email <an AdminEmails entry> --bidders 40 --watchers 5
 ```
 
-Tear down: `sam delete`.
+Tear down with `sam delete`.
 
-## Frontend
-
-Node is installed user-locally at `~/.local/node` (add `export PATH=$HOME/.local/node/bin:$PATH` to your shell).
+### Frontend
 
 ```bash
 cd frontend
-cp .env.example .env.local         # fill in the two URLs from `sam deploy` outputs
+npm ci
+cp .env.example .env.local         # fill in the URLs (and Cognito ids) from the `sam deploy` outputs
 npm run dev                        # http://localhost:3000
 ```
 
-Against the local backend (`python scripts/local_server.py`, admin login `admin@local.test`), use same-origin paths so the
-whole app is served from port 3000. Next.js proxies `/api` and `/ws` to the backend
-(`next.config.ts`), so one tunnel (e.g. `ngrok http 3000`) is enough to share it:
+| Variable | Value |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | `HttpApiUrl` stack output |
+| `NEXT_PUBLIC_WS_URL` | `WebSocketUrl` stack output |
+| `NEXT_PUBLIC_COGNITO_USER_POOL_ID` | `UserPoolId` stack output (omit for dev login) |
+| `NEXT_PUBLIC_COGNITO_CLIENT_ID` | `UserPoolClientId` stack output (omit for dev login) |
+
+**Fully local, without AWS:** run `python backend/scripts/local_server.py` (admin login
+`admin@local.test`), then start the frontend with same-origin paths. Next.js proxies `/api` and
+`/ws` to the local backend (`next.config.ts`), so the whole app runs on port 3000, and a single
+tunnel (e.g. `ngrok http 3000`) is enough to share it:
 
 ```bash
 NEXT_PUBLIC_API_URL=/api NEXT_PUBLIC_WS_URL=/ws npm run dev
 ```
 
-Deploy: connect the repo to **AWS Amplify Hosting** (app root `frontend`, same two env vars). Then
-redeploy the backend with `--parameter-overrides AllowedOrigin=https://<your-amplify-domain>`.
+**Deploying:** connect the repo to **AWS Amplify Hosting**. `amplify.yml` sets the app root to
+`frontend`. Add the env vars above in the Amplify console, then redeploy the backend with
+`AllowedOrigin` and `SiteUrl` set to the Amplify domain.
 
-## Known limits / next steps
-- The offline concurrency test runs on moto. moto's in-process DynamoDB is **not** atomic across threads (without help it lost an update in testing), so the test serialises moto's backend operations to emulate DynamoDB's per-request atomicity. The authoritative concurrency proof is `scripts/concurrency_test.py` against the real stack.
-- In `dev` auth mode anyone can log in as any email, so approval is only as strong as the login. Use `cognito` for anything real.
-- Emails need an SES-verified sender in `NotifyFrom`; while the account is in the SES sandbox they only reach verified addresses. Without `NotifyFrom` they are logged, not sent. Outbid emails aren't throttled, so a long bidding war sends one per lead change.
-- Search is a filtered Scan over `searchText` (fine for thousands of listings; move to OpenSearch beyond that), and price sorts work over at most 1,000 open listings.
-- Browse pages (home, sorts, search) show live and upcoming auctions plus those that ended in the last 15 minutes; older ones stay reachable from their own page, the seller's profile, My bids and Selling.
-- Thumbnails are made by `ThumbnailFunction` a moment after upload; pages fall back to the original image until then (and for images uploaded before thumbnails existed).
-- A login token is checked when the WebSocket connects; a connection opened before approval was revoked still bids as that user, but the bid's `ConditionCheck` rejects it.
-- `GET /me/bids` reads a global secondary index, which is eventually consistent: a bid placed a moment ago can take about a second to appear.
-- A listing stores the seller's display name at creation; renaming later doesn't update old listings.
-- `GET /auctions` reads one index partition (`listing = "ALL"`), which is fine at demo scale; shard it for heavy traffic. Auctions created before this version have no `listing` or `sellerId` and don't appear in lists.
-- Admin user lists use a filtered Scan of the Users table (admin-only and small).
-- Under extreme contention on one auction, a bid can come back `BUSY` after 8 conflict retries (or 60 re-plans). It is rejected cleanly, never applied incorrectly.
-- Upgrading an existing stack: auctions created before the `byEnding` index have no `openListing`, so they don't show under "Ending soon" or the price sorts (they still show under "Newly listed").
-- The WebSocket `Deployment` resource is static. If you add or change routes, rename its logical ID so CloudFormation creates a new deployment.
+---
+
+## Known limits
+
+- **Search** is a filtered Scan over `searchText`, which is fine for thousands of listings. Beyond
+  that it should move to OpenSearch. Price sorts cover at most 1,000 open listings.
+- **Listing pages** read one index partition. That's fine at demo scale, but it should be sharded
+  for heavy traffic.
+- **Emails** need an SES-verified sender. While the account is in the SES sandbox they only reach
+  verified addresses. Outbid emails aren't throttled, so a long bidding war sends one per lead
+  change.
+- **`dev` login** lets anyone sign in as any email, so approval is only as strong as the login.
+- **My bids** reads a secondary index that is eventually consistent. A bid placed a moment ago can
+  take about a second to appear there. The auction page itself is always up to date.
+- **Thumbnails** are created a moment after upload. Pages show the original image until then.
+- **Seller names** are copied onto a listing when it's created, so renaming later doesn't change
+  old listings.
+- **Extreme contention** on one auction can return `BUSY` after repeated retries. The bid is
+  rejected cleanly, never applied incorrectly.
+- **The offline race test** runs on moto, whose in-memory DynamoDB isn't atomic across threads, so
+  the test serialises moto's operations to emulate DynamoDB. The authoritative proof is
+  `scripts/concurrency_test.py` against a real stack.
+- **WebSocket routes:** the `Deployment` resource is static. If you add or change routes, rename
+  its logical ID so CloudFormation creates a new deployment.

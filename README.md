@@ -236,11 +236,11 @@ The `AuthMode` template parameter selects where identities come from:
   so anyone can sign in as any email. It's for local work only. The frontend uses it when no Cognito
   client id is configured.
 
-### Demo admin account
+### Demo admin account for judges
 
-`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) an approved
-admin account, `judge.admin@bidbloom.demo` / `Judge-admin-2026`. The address can't receive mail
-and is never emailed. Add it to the stack's `AdminEmails` to give it admin rights.
+`python backend/scripts/create_demo_accounts.py --stack <stack>` creates (or resets) an approved admin
+account with a known password, `judge.admin@bidbloom.demo` / `Judge-admin-2026`. Its address can't receive
+mail and is never emailed. Add it to the stack's `AdminEmails` for it to have admin rights.
 
 ---
 
